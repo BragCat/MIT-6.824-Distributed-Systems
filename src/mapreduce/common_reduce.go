@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"io"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +51,70 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+	var kvs []KeyValue
+	for i := 0; i < nMap; i++ {
+		imFile := reduceName(jobName, i, reduceTask)
+		imFD, err := os.Open(imFile)
+		if err != nil {
+			debug("Reduce Task %v open intermediate file %v failed.", i, imFile)
+		} else {
+			decoder := json.NewDecoder(imFD)
+			for {
+				var kv KeyValue
+				err := decoder.Decode(&kv)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					debug("Reduce Task %v decode kv from intermediate file %v failed with error %v.",
+						i, imFile, err)
+				} else {
+					kvs = append(kvs, kv)
+				}
+			}
+			imFD.Close()
+		}
+	}
+	sort.Sort(ByKey(kvs))
+
+	outFD, err := os.Create(outFile)
+	if err != nil {
+		debug("Reduce Task %v create output file %v failed.", reduceTask, outFile)
+		return
+	}
+	defer outFD.Close()
+	if len(kvs) == 0 {
+		return
+	}
+	encoder := json.NewEncoder(outFD)
+	key := kvs[0].Key
+	var values []string
+	values = append(values, kvs[0].Value)
+	for i := 1; i < len(kvs); i++ {
+		if key == kvs[i].Key {
+			values = append(values, kvs[i].Value)
+		} else {
+			encoder.Encode(KeyValue{key, reduceF(key, values)})
+			key = kvs[i].Key
+			values = values[:0]
+		}
+	}
+	encoder.Encode(KeyValue{key, reduceF(key, values)})
 }
+
+// slice of KeyValue type to sort
+type ByKey []KeyValue
+
+func (kvs ByKey) Len() int {
+	return len(kvs)
+}
+
+func (kvs ByKey) Swap(i, j int) {
+	kvs[i], kvs[j] = kvs[j], kvs[i]
+}
+
+func (kvs ByKey) Less(i, j int) bool {
+	return kvs[i].Key < kvs[j].Key
+}
+
+
