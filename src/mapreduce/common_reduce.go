@@ -91,13 +91,12 @@ func doReduce(
 	var values []string
 	values = append(values, kvs[0].Value)
 	for i := 1; i < len(kvs); i++ {
-		if key == kvs[i].Key {
-			values = append(values, kvs[i].Value)
-		} else {
+		if key != kvs[i].Key {
 			encoder.Encode(KeyValue{key, reduceF(key, values)})
 			key = kvs[i].Key
 			values = values[:0]
 		}
+		values = append(values, kvs[i].Value)
 	}
 	encoder.Encode(KeyValue{key, reduceF(key, values)})
 }
