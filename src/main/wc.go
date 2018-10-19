@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"mapreduce"
 	"os"
-	//"sort"
 	"strconv"
 	"strings"
 	"unicode"
