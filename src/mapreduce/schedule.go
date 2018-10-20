@@ -30,5 +30,50 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//
 	// Your code here (Part III, Part IV).
 	//
+
+	taskChan := make(chan DoTaskArgs, ntasks)
+	doneChan := make(chan int, ntasks)
+
+	go genTask(jobName, mapFiles, phase, ntasks, n_other, taskChan)
+	go dispatch(registerChan, taskChan, doneChan)
+
+	doneTaskCnt := 0
+	for {
+		doneTaskCnt += <- doneChan
+		if (doneTaskCnt == ntasks) {
+			break
+		}
+	}
+
+	close(taskChan)
+	close(doneChan)
+
 	fmt.Printf("Schedule: %v done\n", phase)
+}
+
+func genTask(jobName string, mapFiles []string, phase jobPhase, ntasks, n_other int, taskChan chan DoTaskArgs) {
+	for i := 0; i < ntasks; i++ {
+		task := DoTaskArgs {jobName, "", phase, i, n_other}
+		if phase == mapPhase {
+			task.File = mapFiles[i]
+		}
+		taskChan <- task
+	}
+}
+
+func dispatch(registerChan chan string, taskChan chan DoTaskArgs, doneChan chan int) {
+	for workerAddr := range registerChan {
+		go startWorker(workerAddr, taskChan, doneChan)
+	}
+}
+
+func startWorker(workerAddr string, taskChan chan DoTaskArgs, doneChan chan int) {
+	for task := range taskChan {
+		success := call(workerAddr, "Worker.DoTask", task, nil)
+		if success {
+			doneChan <- 1
+		} else {
+			taskChan <- task
+		}
+	}
 }
