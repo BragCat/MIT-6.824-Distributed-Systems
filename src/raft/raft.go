@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -77,17 +78,17 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Paper defined persistent state
-	currentTerm		int
-	votedFor		int
-	log				[]Entry
+	currentTerm int
+	votedFor int
+	log []Entry
 
 	// Paper defined volatile state
 	commitIndex int
 	lastApplied int
 
 	// Paper defined volatile state on leaders
-	nextIndex 	[]int
-	matchIndex 	[]int
+	nextIndex []int
+	matchIndex []int
 
 	// My volatile state on leaders
 	peerNum int
@@ -161,10 +162,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term 			int
-	CandidateId 	int
-	LastLogTerm 	int
-	LastLogIndex 	int
+	Term int
+	CandidateId int
+	LastLogTerm int
+	LastLogIndex int
 }
 
 //
@@ -185,7 +186,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	fmt.Printf("server %v term %v votedFor %v receive RequestVoteArgs %v\n", rf.me, rf.currentTerm, rf.votedFor, *args)
 
+	if args.Term < rf.currentTerm {
+		reply.Term, reply.VoteGranted = rf.currentTerm, false
+	} else {
+		valid := rf.votedFor == -1
+		lastLogIndex := 0
+		lastLogTerm := 0
+		if len(rf.log) > 0 {
+			lastLogIndex = len(rf.log) - 1
+			lastLogTerm = rf.log[lastLogIndex].Term
+		}
+		upToDate := args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+		//fmt.Printf("server %v term %v valid: %v, upToDate: %v\n", rf.me, rf.currentTerm, valid, upToDate)
+		reply.Term, reply.VoteGranted = rf.currentTerm, valid && upToDate
+
+		if reply.VoteGranted {
+			rf.votedFor = args.CandidateId
+		}
+	}
+	fmt.Printf("server %v term %v reply RequestVoteReply %v\n", rf.me, rf.currentTerm, *reply)
 }
 
 //
@@ -218,26 +239,52 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	fmt.Printf("server %v send requestVote to server %v\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-func (rf *Raft) processRequestVoteReply(reply *RequestVoteReply) {
+func (rf *Raft) processRequestVoteReply(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	fmt.Printf("server %v term %v voteCnt %v start process reply %v\n", rf.me, rf.currentTerm, rf.voteCnt, *reply)
+
+	// Make sure this reply is to this current term
+	if args.Term != rf.currentTerm {
+		return
+	}
+
+	if rf.state == candidate && reply.VoteGranted {
+		rf.voteCnt++
+		//fmt.Printf("server %v has vote count %v", rf.me, rf.voteCnt)
+		if rf.voteCnt >= rf.majorityNum {
+			rf.state = leader
+
+			nextIndex := len(rf.log)
+			for i, _ := range rf.nextIndex {
+				rf.nextIndex[i] = nextIndex
+				rf.matchIndex[i] = 0
+			}
+
+			rf.electionTimer.Stop()
+			rf.heartBeatTimer.Reset(0)
+		}
+	}
 }
 
 
 type AppendEntriesArgs struct {
-	Term 			int
-	LeaderId		int
-	PrevLogIndex	int
-	PrevLogTerm		int
-	Entries 		[]Entry
-	LeaderCommit 	int
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []Entry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term 	int
+	Term int
 	Success bool
 }
 
@@ -328,6 +375,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // my added code
 func (rf *Raft) startElection() {
+	//fmt.Printf("server %v start election!\n", rf.me)
 	rf.mu.Lock()
 
 	if rf.state == leader {
@@ -347,19 +395,21 @@ func (rf *Raft) startElection() {
 		lastLogTerm = rf.log[lastLogIndex].Term
 	}
 
-	args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogTerm, lastLogIndex}
+	args := &RequestVoteArgs{rf.currentTerm, rf.me, lastLogTerm, lastLogIndex}
 
+	rf.persist()
 	rf.mu.Unlock()
 
 	for i, _ := range rf.peers {
 		if i != rf.me {
-			go func() {
+			go func(rf *Raft, i int, args *RequestVoteArgs) {
 				reply := RequestVoteReply{}
-				ok := rf.sendRequestVote(i, &args, &reply)
+				ok := rf.sendRequestVote(i, args, &reply)
 				if ok {
-					rf.processRequestVoteReply(&reply)
+					//fmt.Printf("server %v get reply from server %v\n", rf.me, i)
+					rf.processRequestVoteReply(args, &reply)
 				}
-			}()
+			}(rf, i, args)
 		}
 	}
 }
