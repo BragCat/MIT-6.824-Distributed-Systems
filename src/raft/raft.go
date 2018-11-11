@@ -56,7 +56,7 @@ type StateType string
 const (
 	maxElectionTimeout = 450
 	minElectionTimeout = 300
-	heartBeatTime = 50
+	heartBeatTime = 105
 
 	leader StateType = "leader"
 	candidate StateType = "candidate"
@@ -253,7 +253,7 @@ func (rf *Raft) processRequestVoteReply(args *RequestVoteArgs, reply *RequestVot
 	//fmt.Printf("server %v term %v voteCnt %v start process reply %v\n", rf.me, rf.currentTerm, rf.voteCnt, *reply)
 
 	// Make sure this reply is to this current term
-	if args.Term != rf.currentTerm {
+	if args.Term != rf.currentTerm || rf.state != candidate{
 		return
 	}
 
@@ -267,7 +267,7 @@ func (rf *Raft) processRequestVoteReply(args *RequestVoteArgs, reply *RequestVot
 		return
 	}
 
-	if rf.state == candidate && reply.VoteGranted {
+	if reply.VoteGranted {
 		rf.voteCnt++
 		//fmt.Printf("server %v has vote count %v", rf.me, rf.voteCnt)
 		if rf.voteCnt >= rf.majorityNum {
@@ -328,6 +328,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) processAppendEntriesReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if args.Term != rf.currentTerm {
+		return
+	}
 
 	if reply.Term > rf.currentTerm {
 		rf.setToFollower(reply.Term)
@@ -456,38 +460,30 @@ func (rf *Raft) startElection() {
 
 	for i, _ := range rf.peers {
 		if i != rf.me {
-			go func(rf *Raft, i int, args *RequestVoteArgs) {
-				reply := RequestVoteReply{}
-				ok := rf.sendRequestVote(i, args, &reply)
-				if ok {
-					//fmt.Printf("server %v get reply from server %v\n", rf.me, i)
-					rf.processRequestVoteReply(args, &reply)
-				}
-			}(rf, i, args)
+			rf.sendRequestVoteTo(i, args);
 		}
 	}
 }
 
-func (rf *Raft) sendHeartBeat() {
-	for i, _ := range rf.peers {
-		if i != rf.me {
-			rf.sendHeartBeatTo(i)
-		}
-	}
-
-	rf.mu.Lock()
-	rf.heartBeatTimer.Reset(getHeartBeatTime())
-	rf.mu.Unlock()
-}
-
-func (rf *Raft) sendHeartBeatTo(peerId int) {
-	rf.mu.Lock()
-
-	if rf.state != leader {
+func (rf *Raft) sendRequestVoteTo(peerId int, args *RequestVoteArgs) {
+	rf.mu.Lock();
+	if rf.state != candidate {
 		rf.mu.Unlock()
 		return
 	}
+	rf.mu.Unlock()
+	go func() {
+		reply := RequestVoteReply{}
+		ok := rf.sendRequestVote(peerId, args, &reply)
+		if ok {
+			//fmt.Printf("server %v get reply from server %v\n", rf.me, i)
+			rf.processRequestVoteReply(args, &reply)
+		}
+	}()
+}
 
+func (rf *Raft) sendHeartBeat() {
+	rf.mu.Lock()
 	prevLogIndex := 0
 	prevLogTerm := 0
 	entry := rf.log
@@ -497,16 +493,37 @@ func (rf *Raft) sendHeartBeatTo(peerId int) {
 		entry = rf.log[prevLogIndex + 1 : ]
 	}
 	args := &AppendEntriesArgs{rf.currentTerm, rf.me,
-	prevLogIndex, prevLogTerm, entry, rf.commitIndex}
+		prevLogIndex, prevLogTerm, entry, rf.commitIndex}
 	rf.mu.Unlock()
 
-	go func(rf *Raft, args *AppendEntriesArgs) {
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			rf.sendHeartBeatTo(i, args)
+		}
+	}
+
+	rf.mu.Lock()
+	if rf.state == leader {
+		rf.heartBeatTimer.Reset(getHeartBeatTime())
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendHeartBeatTo(peerId int, args *AppendEntriesArgs) {
+	rf.mu.Lock()
+	if rf.state != leader {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
+	go func() {
 		reply := &AppendEntriesReply{}
 		ok := rf.sendAppendEntries(peerId, args, reply)
 		if ok {
 			rf.processAppendEntriesReply(args, reply)
 		}
-	}(rf, args)
+	}()
 }
 
 func getElectionTimeout() time.Duration {
