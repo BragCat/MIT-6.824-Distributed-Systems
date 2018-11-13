@@ -253,7 +253,7 @@ func (rf *Raft) processRequestVoteReply(args *RequestVoteArgs, reply *RequestVot
 	//fmt.Printf("server %v term %v voteCnt %v start process reply %v\n", rf.me, rf.currentTerm, rf.voteCnt, *reply)
 
 	// Make sure this reply is to this current term
-	if args.Term != rf.currentTerm || rf.state != candidate{
+	if args.Term != rf.currentTerm || rf.state != candidate {
 		return
 	}
 
@@ -274,8 +274,8 @@ func (rf *Raft) processRequestVoteReply(args *RequestVoteArgs, reply *RequestVot
 			rf.state = leader
 
 			nextIndex := len(rf.log)
-			for i, _ := range rf.nextIndex {
-				rf.nextIndex[i] = nextIndex
+			for i := range rf.nextIndex {
+				rf.nextIndex[i] = nextIndex + 1
 				rf.matchIndex[i] = 0
 			}
 
@@ -311,9 +311,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		if args.Term > rf.currentTerm {
 			rf.setToFollower(args.Term)
+		} else if rf.state == leader {
+			panic("multiple leaders!")
+		} else if rf.state == candidate {
+			rf.setToFollower(args.Term)
 		} else {
 			rf.electionTimer.Reset(getElectionTimeout())
 		}
+
+		/*
+		if args.PrevLogIndex > len(rf.log) - 1 {
+			reply.Term, reply.Success = rf.currentTerm, false
+			return
+		}
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Term, reply.Success = rf.currentTerm, false
+			return
+		}
+
+		// Append new Entries
+		i , j:= args.PrevLogTerm + 1, 0
+		for ; i < len(rf.log) && j < len(args.Entries); {
+			if rf.log[i].Term != args.Entries[j].Term {
+				rf.log = append([]Entry{}, rf.log[ : i]...)
+				rf.log = append(rf.log, args.Entries[j : ]...)
+				j = len(args.Entries)
+				break
+			}
+		}
+		if j != len(args.Entries) {
+			rf.log = append([]Entry{}, rf.log[ : i]...)
+			rf.log = append(rf.log, args.Entries[j : ]...)
+		}
+		*/
 		reply.Term, reply.Success = rf.currentTerm, true
 	}
 
@@ -399,8 +429,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.nextIndex = make([]int, 0)
-	rf.matchIndex = make([]int, 0)
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
 	rf.peerNum = len(peers)
 	rf.majorityNum = (rf.peerNum + 1) / 2
@@ -483,22 +513,9 @@ func (rf *Raft) sendRequestVoteTo(peerId int, args *RequestVoteArgs) {
 }
 
 func (rf *Raft) sendHeartBeat() {
-	rf.mu.Lock()
-	prevLogIndex := 0
-	prevLogTerm := 0
-	entry := rf.log
-	if len(rf.log) > 0 {
-		prevLogIndex = len(rf.log) - 1
-		prevLogTerm = rf.log[prevLogIndex].Term
-		entry = rf.log[prevLogIndex + 1 : ]
-	}
-	args := &AppendEntriesArgs{rf.currentTerm, rf.me,
-		prevLogIndex, prevLogTerm, entry, rf.commitIndex}
-	rf.mu.Unlock()
-
 	for i, _ := range rf.peers {
 		if i != rf.me {
-			rf.sendHeartBeatTo(i, args)
+			rf.sendHeartBeatTo(i)
 		}
 	}
 
@@ -509,12 +526,30 @@ func (rf *Raft) sendHeartBeat() {
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) sendHeartBeatTo(peerId int, args *AppendEntriesArgs) {
+func (rf *Raft) sendHeartBeatTo(peerId int) {
 	rf.mu.Lock()
 	if rf.state != leader {
 		rf.mu.Unlock()
 		return
 	}
+
+	// Construct AppendEntriesArgs
+	prevLogIndex := rf.nextIndex[peerId] - 1
+	prevLogTerm := 0
+	entries := make([]Entry, 0)
+	if len(rf.log) > 0 {
+		prevLogTerm = rf.log[prevLogIndex].Term
+		entries = append(entries, rf.log[prevLogIndex + 1 : ]...)
+	}
+	args := &AppendEntriesArgs{
+		rf.currentTerm,
+		rf.me,
+		prevLogIndex,
+		prevLogTerm,
+		entries,
+		rf.commitIndex,
+	}
+
 	rf.mu.Unlock()
 
 	go func() {
