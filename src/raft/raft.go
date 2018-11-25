@@ -168,7 +168,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&votedFor) != nil ||
 		decoder.Decode(&log) != nil {
-		panic("Read persisted data error.\n")
+		panic("Read persisted data error.")
 	} else {
 		rf.currentTerm, rf.votedFor = currentTerm, votedFor
 		rf.log = log
@@ -379,6 +379,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					rf.log[i].Command,
 					i + 1,
 				}
+				DPrintf("[server %v, term %v]: commit {%v} at index {%v}.",
+					rf.me, rf.currentTerm, rf.log[i].Command, i)
 			}
 			rf.commitIndex = newCommitIndex
 		}
@@ -417,11 +419,14 @@ func (rf *Raft) processAppendEntriesReply(peerId int, args *AppendEntriesArgs, r
 	}
 
 	if reply.Success {
-		rf.nextIndex[peerId] = args.PrevLogIndex + 1 + len(args.Entries)
-		rf.matchIndex[peerId] = rf.nextIndex[peerId] - 1
-		rf.updateCommitIndex()
+		newNextIndex := args.PrevLogIndex + 1 + len(args.Entries)
+		if newNextIndex > rf.nextIndex[peerId] {
+			rf.nextIndex[peerId] = newNextIndex
+			rf.matchIndex[peerId] = newNextIndex - 1
+			rf.updateCommitIndex()
+		}
 	} else {
-		rf.nextIndex[peerId]--
+		rf.nextIndex[peerId] = rf.nextIndex[peerId] / 2
 	}
 }
 
@@ -664,6 +669,8 @@ func (rf *Raft) updateCommitIndex() {
 			rf.log[i].Command,
 			i + 1,
 		}
+		DPrintf("[server %v, term %v]: commit {%v} at index {%v}.",
+			rf.me, rf.currentTerm, rf.log[i].Command, i)
 	}
 }
 
