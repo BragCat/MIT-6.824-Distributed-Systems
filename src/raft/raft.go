@@ -203,12 +203,11 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintf("[server %v, term %v]: receive RequestVoteArgs %v from server %v, currently vote for %v.",
-		rf.me, rf.currentTerm, *args, args.CandidateId, rf.votedFor)
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	DPrintf("[server %v, term %v]: receive RequestVoteArgs %v from server %v, currently vote for %v.",
+		rf.me, rf.currentTerm, *args, args.CandidateId, rf.votedFor)
 
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
@@ -267,16 +266,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	DPrintf("[server %v, term %v]: send RequestVoteArgs %v to server %v.",
-		rf.me, rf.currentTerm, *args, server)
+		args.CandidateId, args.Term, *args, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 func (rf *Raft) processRequestVoteReply(peerId int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("[server %v, term %v]: receive RequestVoteReply %v from server %v.",
-		rf.me, rf.currentTerm, *reply, peerId)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	DPrintf("[server %v, term %v]: receive RequestVoteReply %v from server %v.",
+		rf.me, rf.currentTerm, *reply, peerId)
 
 	// Make sure this reply is to this current term
 	if args.Term != rf.currentTerm || rf.state != candidate {
@@ -285,7 +285,7 @@ func (rf *Raft) processRequestVoteReply(peerId int, args *RequestVoteArgs, reply
 
 	// Abandon stale reply
 	if reply.Term < rf.currentTerm {
-		return;
+		return
 	}
 
 	if reply.Term > rf.currentTerm {
@@ -394,16 +394,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	DPrintf("[server %v, term %v]: send AppendEntriesArgs %v to server %v.",
-		rf.me, rf.currentTerm, *args, server)
+		args.LeaderId, args.Term, *args, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
 func (rf *Raft) processAppendEntriesReply(peerId int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("[server %v, term %v]: receive AppendEntriesReply %v from server %v.",
-		rf.me, rf.currentTerm, *reply, peerId)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	DPrintf("[server %v, term %v]: receive AppendEntriesReply %v from server %v.",
+		rf.me, rf.currentTerm, *reply, peerId)
 
 	// Abandon stale rpcs
 	if args.Term < rf.currentTerm || reply.Term < rf.currentTerm {
@@ -495,9 +496,10 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+
 	rf := &Raft{}
+
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
