@@ -1,6 +1,9 @@
 package raftkv
 
-import "labrpc"
+import (
+	"labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 
@@ -8,6 +11,10 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	lastLeaderId int
+	id int64
+	sequence int
+	mu sync.Mutex
 }
 
 func nrand() int64 {
@@ -21,6 +28,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.lastLeaderId = 0
+	ck.id = nrand()
+	ck.sequence = 0
 	return ck
 }
 
@@ -39,6 +49,26 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	args := GetArgs{
+		Key: key,
+		CkId: ck.id,
+		Sequence: ck.sequence,
+	}
+	ck.sequence++
+
+	nServer := len(ck.servers)
+	for i := ck.lastLeaderId; ; {
+		reply := GetReply{}
+		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+		if ok && !reply.WrongLeader && reply.Err == "" {
+			ck.lastLeaderId = i
+			return reply.Value
+		}
+		i = (i + 1) % nServer
+	}
 	return ""
 }
 
@@ -54,6 +84,28 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	args := PutAppendArgs{
+		Key: key,
+		Value: value,
+		Op: op,
+		CkId: ck.id,
+		Sequence: ck.sequence,
+	}
+	ck.sequence++
+
+	nServer := len(ck.servers)
+	for i := ck.lastLeaderId; ; {
+		reply := PutAppendReply{}
+		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+		if ok && !reply.WrongLeader && reply.Err == "" {
+			ck.lastLeaderId = i
+			return
+		}
+		i = (i + 1) % nServer
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

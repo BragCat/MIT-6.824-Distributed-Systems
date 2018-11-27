@@ -22,6 +22,17 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Operation string
+	Key string
+	Value string
+	CxId int64
+	Sequence int
+}
+
+type StateMachine struct {
+	KVs map[string]string
+	Sequence map[int64]int
+
 }
 
 type KVServer struct {
