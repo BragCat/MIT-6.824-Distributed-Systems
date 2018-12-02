@@ -46,6 +46,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm int
 }
 
 type Entry struct {
@@ -375,9 +376,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			newCommitIndex := min(args.LeaderCommit, len(rf.log) - 1)
 			for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
 				rf.applyCh <- ApplyMsg{
-					true,
-					rf.log[i].Command,
-					i + 1,
+					CommandValid: true,
+					Command: rf.log[i].Command,
+					CommandIndex: i + 1,
+					CommandTerm: rf.log[i].Term,
 				}
 				DPrintf("[server %v, term %v]: commit {%v} at index {%v}.",
 					rf.me, rf.currentTerm, rf.log[i].Command, i)
@@ -460,8 +462,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	} else {
 		DPrintf("[server %v, term %v]: add command %v.", rf.me, rf.currentTerm, command)
 		entry := Entry{
-			rf.currentTerm,
-			command,
+			Term: rf.currentTerm,
+			Command: command,
 		}
 		rf.log = append(rf.log, entry)
 
@@ -567,10 +569,10 @@ func (rf *Raft) startElection() {
 	}
 
 	args := &RequestVoteArgs{
-		rf.currentTerm,
-		rf.me,
-		lastLogTerm,
-		lastLogIndex,
+		Term: rf.currentTerm,
+		CandidateId: rf.me,
+		LastLogTerm: lastLogTerm,
+		LastLogIndex: lastLogIndex,
 	}
 
 	rf.persist()
@@ -628,12 +630,12 @@ func (rf *Raft) sendHeartBeatTo(peerId int) {
 		prevLogTerm = rf.log[prevLogIndex].Term
 	}
 	args := &AppendEntriesArgs{
-		rf.currentTerm,
-		rf.me,
-		prevLogIndex,
-		prevLogTerm,
-		entries,
-		rf.commitIndex,
+		Term: rf.currentTerm,
+		LeaderId: rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm: prevLogTerm,
+		Entries: entries,
+		LeaderCommit: rf.commitIndex,
 	}
 
 	rf.mu.Unlock()
@@ -667,9 +669,10 @@ func (rf *Raft) updateCommitIndex() {
 	}
 	for i := oldCommitIndex + 1; i <= rf.commitIndex; i++ {
 		rf.applyCh <- ApplyMsg{
-			true,
-			rf.log[i].Command,
-			i + 1,
+			CommandValid: true,
+			Command: rf.log[i].Command,
+			CommandIndex: i + 1,
+			CommandTerm: rf.log[i].Term,
 		}
 		DPrintf("[server %v, term %v]: commit {%v} at index {%v}.",
 			rf.me, rf.currentTerm, rf.log[i].Command, i)

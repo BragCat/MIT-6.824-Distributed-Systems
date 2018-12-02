@@ -6,9 +6,10 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -17,6 +18,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const requestTimeOut = 100
 
 type Op struct {
 	// Your definitions here.
@@ -29,10 +31,18 @@ type Op struct {
 	Sequence int
 }
 
+type RequestIndex struct {
+	term int
+	index int
+}
+
+type RequestResult struct {
+	value string
+	pendingChan chan bool
+}
+
 type StateMachine struct {
 	KVs map[string]string
-	Sequence map[int64]int
-
 }
 
 type KVServer struct {
@@ -44,15 +54,112 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	pendingRequests map[RequestIndex]*RequestResult
+	sm StateMachine
+	lastAppliedIndex int
+	exitSignal chan bool
 }
 
+func (kv *KVServer) sendOpLog(op *Op) (bool, Err, string) {
+	index, term, isLeader := kv.rf.Start(*op)
+
+	if !isLeader {
+		return true, "Wrong leader", ""
+	}
+
+	DPrintf("[server %v]: send log %v", kv.me, *op)
+
+	requestIndex := RequestIndex{
+		term: term,
+		index: index,
+	}
+	requestResult := RequestResult{
+		value: "",
+		pendingChan: make(chan bool, 1),
+	}
+	kv.mu.Lock()
+	kv.pendingRequests[requestIndex] = &requestResult
+	kv.mu.Unlock()
+
+	select {
+		case <-requestResult.pendingChan:
+			return false, "", requestResult.value
+		case <- time.After(requestTimeOut):
+	}
+	return false, "Request timeout", ""
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		Operation: "Get",
+		Key: args.Key,
+		Value: "",
+		CxId: args.CkId,
+		Sequence: args.Sequence,
+	}
+
+	wrongLeader, err, value := kv.sendOpLog(&op)
+	reply.WrongLeader = wrongLeader
+	reply.Err = err
+	reply.Value = value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		Operation: args.Op,
+		Key: args.Key,
+		Value: args.Value,
+		CxId: args.CkId,
+		Sequence: args.Sequence,
+	}
+
+	wrongLeader, err, _ := kv.sendOpLog(&op)
+	reply.WrongLeader = wrongLeader
+	reply.Err = err
+}
+
+func (kv *KVServer) daemon() {
+	for {
+		select {
+			case <- kv.exitSignal:
+				return
+			case applyMsg := <- kv.applyCh:
+				if applyMsg.CommandValid {
+					DPrintf("[server %v]: receive ApplyMsg %v", kv.me, applyMsg)
+					command, ok := applyMsg.Command.(Op)
+					if !ok {
+						panic("ApplyMsg.Command convert failed!")
+					}
+					index, term := applyMsg.CommandIndex, applyMsg.CommandTerm
+					kv.mu.Lock()
+					if kv.lastAppliedIndex + 1 != index {
+						panic("ApplyMsg.CommandIndex isn't continuous!")
+					}
+					kv.lastAppliedIndex = index
+					requestIndex := RequestIndex{
+						term: term,
+						index: index,
+					}
+					requestResult := kv.pendingRequests[requestIndex]
+					switch command.Operation {
+					case "Get":
+						requestResult.value = command.Value
+						requestResult.pendingChan <- true
+					case "Put":
+						kv.sm.KVs[command.Key] = command.Value
+						requestResult.pendingChan <- true
+					case "Append":
+						kv.sm.KVs[command.Key] += command.Value
+					default:
+						panic("ApplyMsg.Command operation is invalid!")
+					}
+					delete(kv.pendingRequests, requestIndex)
+					kv.mu.Unlock()
+				}
+		}
+	}
 }
 
 //
@@ -95,6 +202,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.pendingRequests = make(map[RequestIndex]*RequestResult)
+	kv.sm = StateMachine {
+		KVs: make(map[string]string),
+	}
+
+	go kv.daemon()
 
 	return kv
 }
