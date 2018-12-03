@@ -59,6 +59,8 @@ func (ck *Clerk) Get(key string) string {
 	}
 	ck.sequence++
 
+	DPrintf("[client %v]: send GetArgs %v", ck.id, args)
+
 	nServer := len(ck.servers)
 	for i := ck.lastLeaderId; ; {
 		reply := GetReply{}
@@ -95,6 +97,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Sequence: ck.sequence,
 	}
 	ck.sequence++
+
+	DPrintf("[client %v]: send PutAppendArgs %v", ck.id, args)
 
 	nServer := len(ck.servers)
 	for i := ck.lastLeaderId; ; {

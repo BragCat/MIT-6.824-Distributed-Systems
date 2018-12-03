@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,7 +18,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const requestTimeOut = 100
+const requestTimeOut = 100 * time.Millisecond
 
 type Op struct {
 	// Your definitions here.
@@ -67,8 +67,6 @@ func (kv *KVServer) sendOpLog(op *Op) (bool, Err, string) {
 		return true, "Wrong leader", ""
 	}
 
-	DPrintf("[server %v]: send log %v", kv.me, *op)
-
 	requestIndex := RequestIndex{
 		term: term,
 		index: index,
@@ -79,11 +77,17 @@ func (kv *KVServer) sendOpLog(op *Op) (bool, Err, string) {
 	}
 	kv.mu.Lock()
 	kv.pendingRequests[requestIndex] = &requestResult
+	DPrintf("[server %v]: send Op %v, pendingRequest size %v", kv.me, *op, len(kv.pendingRequests))
 	kv.mu.Unlock()
 
 	select {
-		case <-requestResult.pendingChan:
-			return false, "", requestResult.value
+		case success := <- requestResult.pendingChan:
+			DPrintf("[server %v]: reply value %v", kv.me, requestResult.value)
+			var err Err
+			if !success {
+				err = "Apply failed"
+			}
+			return false, err, requestResult.value
 		case <- time.After(requestTimeOut):
 	}
 	return false, "Request timeout", ""
@@ -128,36 +132,60 @@ func (kv *KVServer) daemon() {
 			case applyMsg := <- kv.applyCh:
 				if applyMsg.CommandValid {
 					DPrintf("[server %v]: receive ApplyMsg %v", kv.me, applyMsg)
-					command, ok := applyMsg.Command.(Op)
-					if !ok {
-						panic("ApplyMsg.Command convert failed!")
-					}
-					index, term := applyMsg.CommandIndex, applyMsg.CommandTerm
-					kv.mu.Lock()
-					if kv.lastAppliedIndex + 1 != index {
-						panic("ApplyMsg.CommandIndex isn't continuous!")
-					}
-					kv.lastAppliedIndex = index
-					requestIndex := RequestIndex{
-						term: term,
-						index: index,
-					}
-					requestResult := kv.pendingRequests[requestIndex]
-					switch command.Operation {
-					case "Get":
-						requestResult.value = command.Value
-						requestResult.pendingChan <- true
-					case "Put":
-						kv.sm.KVs[command.Key] = command.Value
-						requestResult.pendingChan <- true
-					case "Append":
-						kv.sm.KVs[command.Key] += command.Value
-					default:
-						panic("ApplyMsg.Command operation is invalid!")
-					}
-					delete(kv.pendingRequests, requestIndex)
-					kv.mu.Unlock()
+					kv.apply(applyMsg)
+					kv.cleanPendingRequests(applyMsg)
 				}
+		}
+	}
+}
+
+func (kv *KVServer) apply(applyMsg raft.ApplyMsg) {
+
+	command, ok := applyMsg.Command.(Op)
+	if !ok {
+		panic("ApplyMsg.Command convert failed!")
+	}
+
+	kv.mu.Lock()
+
+	if kv.lastAppliedIndex + 1 != applyMsg.CommandIndex {
+		panic("ApplyMsg.CommandIndex isn't continuous!")
+	}
+	kv.lastAppliedIndex++
+
+	switch command.Operation {
+	case "Get":
+	case "Put":
+		kv.sm.KVs[command.Key] = command.Value
+	case "Append":
+		kv.sm.KVs[command.Key] += command.Value
+	default:
+		panic("ApplyMsg.Command operation is invalid!")
+	}
+
+	kv.mu.Unlock()
+}
+
+func (kv *KVServer) cleanPendingRequests(applyMsg raft.ApplyMsg) {
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	term, index := applyMsg.CommandTerm, applyMsg.CommandIndex
+	for requestIndex, requestResult := range kv.pendingRequests {
+		if requestIndex.term < term || (requestIndex.term == term && requestIndex.index < index) {
+			requestResult.pendingChan <- false
+			delete(kv.pendingRequests, requestIndex)
+		} else if requestIndex.term == term && requestIndex.index == index {
+			op, ok := applyMsg.Command.(Op)
+			if !ok {
+				panic("ApplyMsg.Command convert failed!")
+			}
+			if op.Operation == "Get" {
+				requestResult.value = kv.sm.KVs[op.Key]
+			}
+			requestResult.pendingChan <- true
+			delete(kv.pendingRequests, requestIndex)
 		}
 	}
 }
@@ -206,6 +234,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.sm = StateMachine {
 		KVs: make(map[string]string),
 	}
+	kv.exitSignal = make(chan bool)
+	kv.lastAppliedIndex = 0
 
 	go kv.daemon()
 
