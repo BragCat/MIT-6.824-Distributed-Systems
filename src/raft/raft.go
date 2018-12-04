@@ -284,7 +284,7 @@ func (rf *Raft) processRequestVoteReply(peerId int, args *RequestVoteArgs, reply
 		return
 	}
 
-	// Abandon stale reply
+	// Abandon stale rpcs
 	if reply.Term < rf.currentTerm {
 		return
 	}
@@ -325,6 +325,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	NextIndex int
+	ConflictTerm int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -335,6 +337,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.me, rf.currentTerm, *args, args.LeaderId)
 
 	if args.Term < rf.currentTerm {
+		// The leader should be set to follower
 		reply.Term, reply.Success = rf.currentTerm, false
 	} else {
 		if args.Term > rf.currentTerm {
@@ -349,10 +352,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		if args.PrevLogIndex > len(rf.log) - 1 {
 			reply.Term, reply.Success = rf.currentTerm, false
+			reply.ConflictTerm = -1
+			reply.NextIndex = len(rf.log)
 			return
 		}
 		if args.PrevLogIndex != -1 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Term, reply.Success = rf.currentTerm, false
+			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			for i := 0; i < len(rf.log); i++ {
+				if rf.log[i].Term == reply.ConflictTerm {
+					reply.NextIndex = i
+					break
+				}
+			}
 			return
 		}
 
@@ -387,6 +399,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = newCommitIndex
 		}
 		reply.Term, reply.Success = rf.currentTerm, true
+		reply.NextIndex = args.PrevLogIndex + 1 + len(args.Entries)
 		rf.persist()
 	}
 
@@ -422,15 +435,26 @@ func (rf *Raft) processAppendEntriesReply(peerId int, args *AppendEntriesArgs, r
 	}
 
 	if reply.Success {
-		newNextIndex := args.PrevLogIndex + 1 + len(args.Entries)
-		if newNextIndex > rf.nextIndex[peerId] {
-			rf.nextIndex[peerId] = newNextIndex
-			rf.matchIndex[peerId] = newNextIndex - 1
+		if reply.NextIndex > rf.nextIndex[peerId] {
+			rf.nextIndex[peerId] = reply.NextIndex
+			rf.matchIndex[peerId] = reply.NextIndex - 1
 			rf.updateCommitIndex()
 		}
 	} else {
-		rf.nextIndex[peerId] = rf.nextIndex[peerId] / 2
+		rf.nextIndex[peerId] = reply.NextIndex
 	}
+}
+
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	data []byte
+}
+
+type InstallSnapshotReply struct {
+	term int
 }
 
 //

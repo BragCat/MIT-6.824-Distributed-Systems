@@ -193,7 +193,7 @@ func (kv *KVServer) apply(applyMsg raft.ApplyMsg) string {
 		}
 		kv.sm.sequence[op.CxId]++
 	} else {
-		panic("Client's sequence is not continues!")
+		panic("Client's sequence is not continuous!")
 	}
 	return result
 }
