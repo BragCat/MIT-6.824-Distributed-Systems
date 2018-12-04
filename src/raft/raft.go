@@ -83,6 +83,8 @@ type Raft struct {
 	currentTerm int
 	votedFor int
 	log []Entry
+	lastIncludedIndex int
+	lastIncludedTerm int
 
 	// Paper defined volatile state
 	commitIndex int
@@ -134,6 +136,8 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.currentTerm)
 	encoder.Encode(rf.votedFor)
 	encoder.Encode(rf.log)
+	encoder.Encode(rf.lastIncludedIndex)
+	encoder.Encode(rf.lastIncludedTerm)
 	data := buffer.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -164,15 +168,18 @@ func (rf *Raft) readPersist(data []byte) {
 
 	buffer := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(buffer)
-	var currentTerm, votedFor int
+	var currentTerm, votedFor, lastIncludedIndex, lastIncludedTerm int
 	log := make([]Entry, 0)
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&votedFor) != nil ||
-		decoder.Decode(&log) != nil {
+		decoder.Decode(&log) != nil ||
+		decoder.Decode(&lastIncludedIndex) != nil ||
+		decoder.Decode(&lastIncludedTerm) != nil {
 		panic("Read persisted data error.")
 	} else {
 		rf.currentTerm, rf.votedFor = currentTerm, votedFor
 		rf.log = log
+		rf.lastIncludedIndex, rf.lastIncludedTerm = lastIncludedIndex, lastIncludedTerm
 	}
 }
 
@@ -326,7 +333,6 @@ type AppendEntriesReply struct {
 	Term int
 	Success bool
 	NextIndex int
-	ConflictTerm int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -352,15 +358,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		if args.PrevLogIndex > len(rf.log) - 1 {
 			reply.Term, reply.Success = rf.currentTerm, false
-			reply.ConflictTerm = -1
 			reply.NextIndex = len(rf.log)
 			return
 		}
 		if args.PrevLogIndex != -1 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Term, reply.Success = rf.currentTerm, false
-			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			conflictTerm := rf.log[args.PrevLogIndex].Term
 			for i := 0; i < len(rf.log); i++ {
-				if rf.log[i].Term == reply.ConflictTerm {
+				if rf.log[i].Term == conflictTerm {
 					reply.NextIndex = i
 					break
 				}
@@ -446,15 +451,43 @@ func (rf *Raft) processAppendEntriesReply(peerId int, args *AppendEntriesArgs, r
 }
 
 type InstallSnapshotArgs struct {
-	Term int
-	LeaderId int
+	Term              int
+	LeaderId          int
 	LastIncludedIndex int
-	LastIncludedTerm int
-	data []byte
+	LastIncludedTerm  int
+	Data              []byte
 }
 
 type InstallSnapshotReply struct {
-	term int
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	DPrintf("[server %v, term %v]: send InstallSnapshotArgs %v to server %v",
+		args.LeaderId, args.Term, &args, server)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) processInstallSnapshot(peerId int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm || reply.Term < rf.currentTerm || rf.state != leader {
+		return
+	}
+
+	if reply.Term > rf.currentTerm {
+		rf.setToFollower(reply.Term)
+		return
+	}
+
+	rf.nextIndex[peerId] = max(rf.nextIndex[peerId], args.LastIncludedIndex + 1)
+	rf.matchIndex[peerId] = max(rf.matchIndex[peerId], args.LastIncludedIndex)
 }
 
 //
@@ -534,6 +567,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]Entry, 0)
+	rf.lastIncludedIndex = -1
+	rf.lastIncludedTerm = -1
 
 	rf.commitIndex = -1
 	rf.lastApplied = -1
@@ -617,10 +652,10 @@ func (rf *Raft) sendRequestVoteTo(peerId int, args *RequestVoteArgs) {
 	}
 	rf.mu.Unlock()
 	go func() {
-		reply := RequestVoteReply{}
-		ok := rf.sendRequestVote(peerId, args, &reply)
+		reply := &RequestVoteReply{}
+		ok := rf.sendRequestVote(peerId, args, reply)
 		if ok {
-			rf.processRequestVoteReply(peerId, args, &reply)
+			rf.processRequestVoteReply(peerId, args, reply)
 		}
 	}()
 }
@@ -646,31 +681,51 @@ func (rf *Raft) sendHeartBeatTo(peerId int) {
 		return
 	}
 
-	// Construct AppendEntriesArgs
-	prevLogIndex := rf.nextIndex[peerId] - 1
-	prevLogTerm := 0
-	entries := append([]Entry{}, rf.log[prevLogIndex + 1 : ]...)
-	if  prevLogIndex >= 0 {
-		prevLogTerm = rf.log[prevLogIndex].Term
-	}
-	args := &AppendEntriesArgs{
-		Term: rf.currentTerm,
-		LeaderId: rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm: prevLogTerm,
-		Entries: entries,
-		LeaderCommit: rf.commitIndex,
-	}
-
-	rf.mu.Unlock()
-
-	go func() {
-		reply := &AppendEntriesReply{}
-		ok := rf.sendAppendEntries(peerId, args, reply)
-		if ok {
-			rf.processAppendEntriesReply(peerId, args, reply)
+	if rf.nextIndex[peerId] <= rf.lastIncludedIndex {
+		// Send InstallSnapshotArgs
+		args := &InstallSnapshotArgs{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			LastIncludedIndex: rf.lastIncludedIndex,
+			LastIncludedTerm:  rf.lastIncludedTerm,
+			Data:              rf.persister.ReadSnapshot(),
 		}
-	}()
+
+		rf.mu.Unlock()
+
+		go func() {
+			reply := &InstallSnapshotReply{}
+			ok := rf.sendInstallSnapshot(peerId, args, reply)
+			if ok {
+				rf.processInstallSnapshot(peerId, args, reply)
+			}
+		}()
+	} else {
+		// Send AppendEntriesArgs
+		prevLogIndex, prevLogTerm := rf.nextIndex[peerId]-1, rf.lastIncludedTerm
+		if prevLogIndex != rf.lastIncludedIndex {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+		entries := append([]Entry{}, rf.log[prevLogIndex+1:]...)
+		args := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
+		}
+
+		rf.mu.Unlock()
+
+		go func() {
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(peerId, args, reply)
+			if ok {
+				rf.processAppendEntriesReply(peerId, args, reply)
+			}
+		}()
+	}
 }
 
 func (rf *Raft) updateCommitIndex() {
@@ -714,6 +769,14 @@ func getHeartBeatTime() time.Duration {
 
 func min(a int, b int) int {
 	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func max(a int, b int) int {
+	if a > b {
 		return a
 	} else {
 		return b
