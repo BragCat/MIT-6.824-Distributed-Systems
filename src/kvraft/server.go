@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -50,6 +51,7 @@ type StateMachine struct {
 	kvs map[string]string
 	sequence map[int64]int
 	getResultCache map[int64]GetResult
+	lastAppliedIndex int
 }
 
 
@@ -62,9 +64,9 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister *raft.Persister
 	pendingRequests map[RequestIndex]*RequestResult
 	sm StateMachine
-	lastAppliedIndex int
 	exitSignal chan bool
 }
 
@@ -140,62 +142,82 @@ func (kv *KVServer) daemon() {
 			case applyMsg := <- kv.applyCh:
 				if applyMsg.CommandValid {
 					DPrintf("[server %v]: receive ApplyMsg %v", kv.me, applyMsg)
-					result := kv.apply(applyMsg)
+					result, isSnapshot := kv.apply(applyMsg)
 					kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex, result)
+
+					if !isSnapshot {
+						kv.takeSnapshot()
+					}
 				}
 		}
 	}
 }
 
-func (kv *KVServer) apply(applyMsg raft.ApplyMsg) string {
-
-	op, ok := applyMsg.Command.(Op)
-	if !ok {
-		panic("ApplyMsg.Command convert failed!")
-	}
+func (kv *KVServer) apply(applyMsg raft.ApplyMsg) (result string, isSnapshot bool) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	DPrintf("[server %v]: apply operation %v", kv.me, op)
+	result = ""
+	isSnapshot = !applyMsg.CommandValid
 
-	if kv.lastAppliedIndex + 1 != applyMsg.CommandIndex {
-		panic("ApplyMsg.CommandIndex isn't continuous!")
-	}
-	kv.lastAppliedIndex++
+	if applyMsg.CommandValid {
 
-	result := ""
-	if op.Sequence < kv.sm.sequence[op.CxId] {
-		// Only take care of "Get", stale "PutAppend" operations should be abandoned
-		DPrintf("[server %v]: operation %v is stale", kv.me, op)
-		if op.Operation == "Get" {
-			lastGetResult := kv.sm.getResultCache[op.CxId]
-			if op.Sequence != lastGetResult.sequence {
-				panic("Get op is applied unordered!")
-			}
-			result = lastGetResult.value
+		op, ok := applyMsg.Command.(Op)
+		if !ok {
+			panic("ApplyMsg.Command convert failed!")
 		}
-	} else if op.Sequence == kv.sm.sequence[op.CxId] {
-		DPrintf("[server %v]: operation %v is fresh", kv.me, op)
-		switch op.Operation {
-		case "Get":
-			kv.sm.getResultCache[op.CxId] = GetResult{
-				sequence: op.Sequence,
-				value:    kv.sm.kvs[op.Key],
-			}
-			result = kv.sm.kvs[op.Key]
-		case "Put":
-			kv.sm.kvs[op.Key] = op.Value
-		case "Append":
-			kv.sm.kvs[op.Key] += op.Value
-		default:
-			panic("ApplyMsg.Command operation is invalid!")
+
+		DPrintf("[server %v]: apply operation %v", kv.me, op)
+
+		if kv.sm.lastAppliedIndex + 1 != applyMsg.CommandIndex {
+			panic("ApplyMsg.CommandIndex isn't continuous!")
 		}
-		kv.sm.sequence[op.CxId]++
+		kv.sm.lastAppliedIndex++
+
+		if op.Sequence < kv.sm.sequence[op.CxId] {
+			// Only take care of "Get", stale "PutAppend" operations should be abandoned
+			DPrintf("[server %v]: operation %v is stale", kv.me, op)
+			if op.Operation == "Get" {
+				lastGetResult := kv.sm.getResultCache[op.CxId]
+				if op.Sequence != lastGetResult.sequence {
+					panic("Get op is applied unordered!")
+				}
+				result = lastGetResult.value
+			}
+		} else if op.Sequence == kv.sm.sequence[op.CxId] {
+			DPrintf("[server %v]: operation %v is fresh", kv.me, op)
+			switch op.Operation {
+			case "Get":
+				kv.sm.getResultCache[op.CxId] = GetResult{
+					sequence: op.Sequence,
+					value:    kv.sm.kvs[op.Key],
+				}
+				result = kv.sm.kvs[op.Key]
+			case "Put":
+				kv.sm.kvs[op.Key] = op.Value
+			case "Append":
+				kv.sm.kvs[op.Key] += op.Value
+			default:
+				panic("ApplyMsg.Command operation is invalid!")
+			}
+			kv.sm.sequence[op.CxId]++
+		} else {
+			panic("Client's sequence is not continuous!")
+		}
 	} else {
-		panic("Client's sequence is not continuous!")
+		buffer := bytes.NewBuffer(applyMsg.Command.([]byte))
+		decoder := labgob.NewDecoder(buffer)
+		var newSM StateMachine
+		if decoder.Decode(&newSM) != nil {
+			panic("Decode snapshot error!")
+		} else {
+			if newSM.lastAppliedIndex > kv.sm.lastAppliedIndex {
+				kv.sm = newSM
+			}
+		}
 	}
-	return result
+	return result, isSnapshot
 }
 
 func (kv *KVServer) cleanPendingRequests(term int, index int, result string) {
@@ -213,6 +235,23 @@ func (kv *KVServer) cleanPendingRequests(term int, index int, result string) {
 			delete(kv.pendingRequests, requestIndex)
 		}
 	}
+}
+
+func (kv *KVServer) takeSnapshot() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() <= kv.maxraftstate {
+		return
+	}
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(kv.sm)
+	data := buffer.Bytes()
+	go func() {
+		kv.rf.TakeSnapshot(data, kv.sm.lastAppliedIndex)
+	}()
 }
 
 //
@@ -255,14 +294,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.persister = persister
 	kv.pendingRequests = make(map[RequestIndex]*RequestResult)
 	kv.sm = StateMachine {
 		kvs: make(map[string]string),
 		sequence: make(map[int64]int),
 		getResultCache: make(map[int64]GetResult),
+		lastAppliedIndex: 0,
 	}
 	kv.exitSignal = make(chan bool)
-	kv.lastAppliedIndex = 0
 
 	go kv.daemon()
 

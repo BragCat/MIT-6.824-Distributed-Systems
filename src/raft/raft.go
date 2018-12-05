@@ -131,7 +131,7 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-	buffer := new (bytes.Buffer)
+	buffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(buffer)
 	encoder.Encode(rf.currentTerm)
 	encoder.Encode(rf.votedFor)
@@ -471,7 +471,44 @@ type InstallSnapshotReply struct {
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	DPrintf("[server %v, term %v]: receive InstallSnapshotArgs %v from server %v.",
+		rf.me, rf.currentTerm, *args, args.LeaderId)
+
+	if args.Term >= rf.currentTerm {
+		if rf.state != follower {
+			rf.setToFollower(args.Term)
+		} else if rf.currentTerm < args.Term {
+			rf.currentTerm = args.Term
+		}
+
+		rf.lastIncludedIndex = args.LastIncludedIndex
+		rf.lastIncludedTerm = args.LastIncludedTerm
+		lastIncludedOffset := rf.index2offset(args.LastIncludedIndex)
+		if lastIncludedOffset >= len(rf.log) - 1 {
+			rf.log = make([]Entry, 0)
+		} else {
+			if rf.log[lastIncludedOffset].Term == rf.lastIncludedTerm {
+				rf.log = append([]Entry{}, rf.log[lastIncludedOffset + 1 : ]...)
+			} else {
+				rf.log = make([]Entry, 0)
+			}
+		}
+		rf.commitIndex = max(rf.commitIndex, rf.lastIncludedIndex)
+
+		rf.persist()
+		rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), args.Data)
+
+		rf.applyCh <- ApplyMsg{
+			CommandValid: false,
+			Command:      args.Data,
+			CommandIndex: 0,
+			CommandTerm:  0,
+		}
+	}
+	reply.Term = rf.currentTerm
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -496,6 +533,22 @@ func (rf *Raft) processInstallSnapshot(peerId int, args *InstallSnapshotArgs, re
 
 	rf.nextIndex[peerId] = max(rf.nextIndex[peerId], args.LastIncludedIndex + 1)
 	rf.matchIndex[peerId] = max(rf.matchIndex[peerId], args.LastIncludedIndex)
+}
+
+func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if lastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	}
+
+	lastIncludedOffset := rf.index2offset(lastIncludedIndex)
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = rf.log[lastIncludedOffset].Term
+	rf.log = append([]Entry{}, rf.log[lastIncludedOffset + 1 : ]...)
+	rf.persist()
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 }
 
 //
