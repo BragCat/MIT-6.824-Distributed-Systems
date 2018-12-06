@@ -308,7 +308,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	go kv.daemon()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.rf.ReplayFromSnapshot()
 
 	return kv
 }

@@ -559,7 +559,7 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
 	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 }
 
-func (rf *Raft) ReplayFromSnapshot() {
+func (rf *Raft) replayFromSnapshot() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -673,6 +673,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.commitIndex = rf.lastIncludedIndex
+	rf.replayFromSnapshot()
 
 	return rf
 }
