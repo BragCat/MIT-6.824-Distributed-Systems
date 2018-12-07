@@ -28,7 +28,7 @@ type Op struct {
 	Operation string
 	Key string
 	Value string
-	CxId int64
+	CkId int64
 	Sequence int
 }
 
@@ -100,8 +100,8 @@ func (kv *KVServer) sendOpLog(op Op) (bool, Err, string) {
 			}
 			return false, err, requestResult.value
 		case <- time.After(requestTimeOut):
+			return false, "Request timeout", ""
 	}
-	return false, "Request timeout", ""
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -110,7 +110,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Operation: "Get",
 		Key: args.Key,
 		Value: "",
-		CxId: args.CkId,
+		CkId: args.CkId,
 		Sequence: args.Sequence,
 	}
 
@@ -126,7 +126,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Operation: args.Op,
 		Key: args.Key,
 		Value: args.Value,
-		CxId: args.CkId,
+		CkId: args.CkId,
 		Sequence: args.Sequence,
 	}
 
@@ -175,21 +175,21 @@ func (kv *KVServer) apply(applyMsg raft.ApplyMsg) (result string, isSnapshot boo
 		}
 		kv.sm.LastAppliedIndex++
 
-		if op.Sequence < kv.sm.Sequence[op.CxId] {
+		if op.Sequence < kv.sm.Sequence[op.CkId] {
 			// Only take care of "Get", stale "PutAppend" operations should be abandoned
 			DPrintf("[KVServer %v]: operation %v is stale", kv.me, op)
 			if op.Operation == "Get" {
-				lastGetResult := kv.sm.GetResultCache[op.CxId]
+				lastGetResult := kv.sm.GetResultCache[op.CkId]
 				if op.Sequence != lastGetResult.Sequence {
 					panic("Get op is applied unordered!")
 				}
 				result = lastGetResult.Value
 			}
-		} else if op.Sequence == kv.sm.Sequence[op.CxId] {
+		} else if op.Sequence == kv.sm.Sequence[op.CkId] {
 			DPrintf("[KVServer %v]: operation %v is fresh", kv.me, op)
 			switch op.Operation {
 			case "Get":
-				kv.sm.GetResultCache[op.CxId] = GetResult{
+				kv.sm.GetResultCache[op.CkId] = GetResult{
 					Sequence: op.Sequence,
 					Value:    kv.sm.KVs[op.Key],
 				}
@@ -201,7 +201,7 @@ func (kv *KVServer) apply(applyMsg raft.ApplyMsg) (result string, isSnapshot boo
 			default:
 				panic("ApplyMsg.Command operation is invalid!")
 			}
-			kv.sm.Sequence[op.CxId]++
+			kv.sm.Sequence[op.CkId]++
 		} else {
 			panic("Client's sequence is not continuous!")
 		}
@@ -268,6 +268,7 @@ func (kv *KVServer) takeSnapshot() {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.exitSignal <- true
 }
 
 //
