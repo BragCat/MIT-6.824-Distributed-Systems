@@ -321,18 +321,18 @@ func (rf *Raft) processRequestVoteReply(peerId int, args *RequestVoteArgs, reply
 
 
 type AppendEntriesArgs struct {
-	Term int
-	LeaderId int
-	PrevLogIndex int
-	PrevLogTerm int
-	Entries []Entry
-	LeaderCommit int
+	Term 			int
+	LeaderId 		int
+	PrevLogIndex 	int
+	PrevLogTerm 	int
+	Entries 		[]Entry
+	LeaderCommit 	int
 }
 
 type AppendEntriesReply struct {
-	Term int
-	Success bool
-	NextIndex int
+	Term 		int
+	Success 	bool
+	NextIndex 	int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -383,6 +383,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		// Append new entries
+		DPrintf("[Raft %v, Term %v]: append log start, rf.log is %v",
+			rf.me, rf.currentTerm, rf.log)
 		rfOffset, argsOffset := prevLogOffset + 1, 0
 		for ; rfOffset < len(rf.log) && argsOffset < len(args.Entries); {
 			if rf.log[rfOffset].Term != args.Entries[argsOffset].Term {
@@ -396,6 +398,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if argsOffset != len(args.Entries) {
 			rf.log = append(rf.log, args.Entries[argsOffset : ]...)
 		}
+		DPrintf("[Raft %v, Term %v]: append log finished, rf.log is %v",
+			rf.me, rf.currentTerm, rf.log)
 
 		if args.LeaderCommit > rf.commitIndex {
 			newCommitIndex := min(args.LeaderCommit, rf.offset2index(len(rf.log) - 1))
@@ -737,13 +741,13 @@ func (rf *Raft) sendRequestVoteTo(peerId int, args *RequestVoteArgs) {
 		return
 	}
 	rf.mu.Unlock()
-	go func() {
+	go func(peerId int, args *RequestVoteArgs) {
 		reply := &RequestVoteReply{}
 		ok := rf.sendRequestVote(peerId, args, reply)
 		if ok {
 			rf.processRequestVoteReply(peerId, args, reply)
 		}
-	}()
+	}(peerId, args)
 }
 
 func (rf *Raft) sendHeartBeat() {
@@ -779,38 +783,37 @@ func (rf *Raft) sendHeartBeatTo(peerId int) {
 
 		rf.mu.Unlock()
 
-		go func() {
+		go func(peerId int, args *InstallSnapshotArgs) {
 			reply := &InstallSnapshotReply{}
 			ok := rf.sendInstallSnapshot(peerId, args, reply)
 			if ok {
 				rf.processInstallSnapshot(peerId, args, reply)
 			}
-		}()
+		}(peerId, args)
 	} else {
 		// Send AppendEntriesArgs
 		prevLogIndex, prevLogTerm := rf.nextIndex[peerId] - 1, rf.lastIncludedTerm
 		if prevLogIndex != rf.lastIncludedIndex {
 			prevLogTerm = rf.log[rf.index2offset(prevLogIndex)].Term
 		}
-		entries := append([]Entry{}, rf.log[rf.index2offset(prevLogIndex + 1) : ]...)
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
-			Entries:      entries,
+			Entries:      rf.log[rf.index2offset(prevLogIndex + 1) : ],
 			LeaderCommit: rf.commitIndex,
 		}
 
 		rf.mu.Unlock()
 
-		go func() {
+		go func(peerId int, args *AppendEntriesArgs) {
 			reply := &AppendEntriesReply{}
 			ok := rf.sendAppendEntries(peerId, args, reply)
 			if ok {
 				rf.processAppendEntriesReply(peerId, args, reply)
 			}
-		}()
+		}(peerId, args)
 	}
 }
 
