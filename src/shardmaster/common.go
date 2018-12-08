@@ -28,6 +28,53 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (config *Config) shuffle() {
+	groupNum := len(config.Groups)
+	if groupNum == 0 {
+		config.Shards = [NShards]int{}
+		return
+	}
+	shardsPerGroup := NShards / groupNum
+	extraShards := NShards % groupNum
+
+	shuffleShards := make([]int, 0)
+	groupLoad := make(map[int]int)
+	for shard, gid  := range config.Shards {
+		_, exist := config.Groups[gid]
+		if exist {
+			if groupLoad[gid] < shardsPerGroup {
+				groupLoad[gid]++
+			} else if groupLoad[gid] == shardsPerGroup {
+				if extraShards > 0 {
+					extraShards--
+					groupLoad[gid]++
+				} else {
+					shuffleShards = append(shuffleShards, shard)
+				}
+			} else {
+				shuffleShards = append(shuffleShards, shard)
+			}
+		} else {
+			shuffleShards = append(shuffleShards, shard)
+		}
+	}
+
+	for shard := range shuffleShards {
+		for gid := range config.Groups {
+			if groupLoad[gid] < shardsPerGroup {
+				config.Shards[shard] = gid
+				groupLoad[gid]++
+				break
+			} else if groupLoad[gid] == shardsPerGroup && extraShards > 0 {
+				config.Shards[shard] = gid
+				groupLoad[gid]++
+				extraShards--
+				break
+			}
+		}
+	}
+}
+
 const (
 	OK = "OK"
 )

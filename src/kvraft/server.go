@@ -138,12 +138,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) daemon() {
 	for {
 		select {
-		case <-kv.exitSignal:
+		case <- kv.exitSignal:
 			return
-		case applyMsg := <-kv.applyCh:
+		case applyMsg := <- kv.applyCh:
 			DPrintf("[KVServer %v]: receive ApplyMsg %v", kv.me, applyMsg)
 			result, isSnapshot := kv.apply(applyMsg)
-			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex-1, result)
+			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex - 1, result)
 
 			if !isSnapshot {
 				kv.takeSnapshot()
