@@ -19,14 +19,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OperationType string
 
 const (
 	TIMEOUT = 1000 * time.Millisecond
 
-	JOIN	= iota
-	LEAVE
-	MOVE
-	QUERY
+	JOIN 	OperationType = "JOIN"
+	LEAVE 	OperationType = "LEAVE"
+	MOVE 	OperationType = "MOVE"
+	QUERY	OperationType = "QUERY"
 )
 
 type RequestIndex struct {
@@ -61,7 +62,7 @@ type ShardMaster struct {
 
 type Op struct {
 	// Your data here.
-	Operation 	int
+	Operation 	OperationType
 	Argument 	interface{}
 	CkId		int64
 	Sequence	int
@@ -78,7 +79,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		Sequence:  	args.Sequence,
 	}
 
-	reply.WrongLeader, reply.Err, _ = sm.sendCommand(op)
+	reply.WrongLeader, reply.Err, _ = sm.sendCommand(&op)
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
@@ -91,7 +92,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 		Sequence:	args.Sequence,
 	}
 
-	reply.WrongLeader, reply.Err, _ = sm.sendCommand(op)
+	reply.WrongLeader, reply.Err, _ = sm.sendCommand(&op)
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
@@ -104,7 +105,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 		Sequence:	args.Sequence,
 	}
 
-	reply.WrongLeader, reply.Err, _ = sm.sendCommand(op)
+	reply.WrongLeader, reply.Err, _ = sm.sendCommand(&op)
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
@@ -117,12 +118,12 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		Sequence:	args.Sequence,
 	}
 
-	reply.WrongLeader, reply.Err, reply.Config = sm.sendCommand(op)
+	reply.WrongLeader, reply.Err, reply.Config = sm.sendCommand(&op)
 }
 
-func (sm *ShardMaster) sendCommand(op Op) (bool, Err, Config) {
-	DPrintf("[ShardMaster %v]: send command %v.", sm.me, op)
-	index, term, isLeader := sm.rf.Start(op)
+func (sm *ShardMaster) sendCommand(op *Op) (bool, Err, Config) {
+	DPrintf("[ShardMaster %v]: send command %v.", sm.me, *op)
+	index, term, isLeader := sm.rf.Start(*op)
 	index--
 
 	if !isLeader {

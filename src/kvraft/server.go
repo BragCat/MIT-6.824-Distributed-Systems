@@ -242,7 +242,8 @@ func (kv *KVServer) takeSnapshot() {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() <= kv.maxraftstate {
+	threshold := kv.maxraftstate / 5 * 4
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() <= threshold {
 		return
 	}
 

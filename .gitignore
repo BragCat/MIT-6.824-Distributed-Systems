@@ -4,3 +4,4 @@ api.key
 .idea/
 out
 output
+.DS_Store
