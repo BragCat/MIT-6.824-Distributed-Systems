@@ -1,23 +1,12 @@
 package shardmaster
 
-
 import (
-	"log"
 	"raft"
 	"time"
 )
 import "labrpc"
 import "sync"
 import "labgob"
-
-const Debug = 1
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
 
 type OperationType string
 
@@ -71,7 +60,6 @@ type Op struct {
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
-	DPrintf("[ShardMaster %v]: receive JoinArgs %v", sm.me, *args)
 	op := Op{
 		Operation: 	JOIN,
 		Argument:	args.Servers,
@@ -84,10 +72,9 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
-	DPrintf("[ShardMaster %v]: receive LeaveArgs %v", sm.me, *args)
 	op := Op{
 		Operation: 	LEAVE,
-		Argument:	args.GIDs,
+		Argument:	append([]int{}, args.GIDs...),
 		CkId:		args.CkId,
 		Sequence:	args.Sequence,
 	}
@@ -97,7 +84,6 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
-	DPrintf("[ShardMaster %v]: receive MoveArgs %v", sm.me, *args)
 	op := Op{
 		Operation:	MOVE,
 		Argument: 	*args,
@@ -110,7 +96,6 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-	DPrintf("[ShardMaster %v]: receive QueryArgs %v", sm.me, *args)
 	op := Op{
 		Operation:	QUERY,
 		Argument:	args.Num,
@@ -122,13 +107,13 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 }
 
 func (sm *ShardMaster) sendCommand(op *Op) (bool, Err, Config) {
-	DPrintf("[ShardMaster %v]: send command %v.", sm.me, *op)
 	index, term, isLeader := sm.rf.Start(*op)
 	index--
 
 	if !isLeader {
 		return true, "Wrong Leader", Config{}
 	}
+	DPrintf("[ShardMaster %v]: send commmand %v.", sm.me, *op)
 
 	requestIndex := RequestIndex{
 		index: index,
@@ -146,6 +131,10 @@ func (sm *ShardMaster) sendCommand(op *Op) (bool, Err, Config) {
 	select {
 	case success := <- requestResult.pendingCh:
 		if success {
+			if op.Operation == QUERY {
+				DPrintf("[ShardMaster %v]: reply QUERY %v of Config %v",
+					sm.me, op.Argument, requestResult.value)
+			}
 			return false, "", requestResult.value
 		} else {
 			return false, "Apply Failed", Config{}
@@ -163,13 +152,13 @@ func (sm *ShardMaster) daemon() {
 			return
 		case applyMsg := <- sm.applyCh:
 			DPrintf("[ShardMaster %v]: receive ApplyMsg %v", sm.me, applyMsg)
-			config := sm.apply(applyMsg)
+			config := sm.apply(&applyMsg)
 			sm.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex - 1, config)
 		}
 	}
 }
 
-func (sm *ShardMaster) apply(applyMsg raft.ApplyMsg) *Config {
+func (sm *ShardMaster) apply(applyMsg *raft.ApplyMsg) *Config {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -179,6 +168,7 @@ func (sm *ShardMaster) apply(applyMsg raft.ApplyMsg) *Config {
 		}
 		sm.stateMachine.lastAppliedIndex++
 		op, ok := applyMsg.Command.(Op)
+		DPrintf("[ShardMaster %v]: apply command %v.", sm.me, op)
 
 		if !ok {
 			panic("ApplyMsg.Command convert to Op failed!")
@@ -192,13 +182,24 @@ func (sm *ShardMaster) apply(applyMsg raft.ApplyMsg) *Config {
 			if index == -1 {
 				index = len(sm.stateMachine.configs) - 1
 			}
+			if op.Sequence == sm.stateMachine.sequence[op.CkId] {
+				sm.stateMachine.sequence[op.CkId]++
+			}
 			return &sm.stateMachine.configs[index]
 		} else if op.Sequence == sm.stateMachine.sequence[op.CkId] {
+			sm.stateMachine.sequence[op.CkId]++
 			configNum := len(sm.stateMachine.configs)
+			lastConfig := sm.stateMachine.configs[configNum - 1]
 			config := Config{
-				Num:	configNum,
+				Num:    configNum,
 				Shards: [NShards]int{},
-				Groups: sm.stateMachine.configs[configNum - 1].Groups,
+				Groups: make(map[int][]string),
+			}
+			for shardId := range lastConfig.Shards {
+				config.Shards[shardId] = lastConfig.Shards[shardId]
+			}
+			for gid, servers := range lastConfig.Groups {
+				config.Groups[gid] = append([]string{}, servers...)
 			}
 			switch op.Operation {
 			case JOIN:
@@ -231,6 +232,8 @@ func (sm *ShardMaster) apply(applyMsg raft.ApplyMsg) *Config {
 				panic("Unknown operation!")
 			}
 			sm.stateMachine.configs = append(sm.stateMachine.configs, config)
+			DPrintf("[ShardMaster %v]: config changed, config list is %v",
+				sm.me, sm.stateMachine.configs)
 		}
 	} else {
 		// Raft read snapshot to initialize when start up
@@ -283,8 +286,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm := new(ShardMaster)
 	sm.me = me
 
-
 	labgob.Register(Op{})
+	labgob.Register(make(map[int][]string))
+	labgob.Register([]int{})
+	labgob.Register(MoveArgs{})
+
 	sm.applyCh = make(chan raft.ApplyMsg)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 

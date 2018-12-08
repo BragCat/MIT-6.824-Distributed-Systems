@@ -424,10 +424,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.me, rf.currentTerm, *reply, len(rf.log), rf.commitIndex)
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(peerId int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	DPrintf("[Raft %v, Term %v]: send AppendEntriesArgs %v to Raft %v.",
-		args.LeaderId, args.Term, *args, server)
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		args.LeaderId, args.Term, *args, peerId)
+	ok := rf.peers[peerId].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -612,12 +612,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 		}
 		rf.log = append(rf.log, entry)
+		rf.heartBeatTimer.Reset(0)
+		rf.persist()
 
 		index = rf.offset2index(len(rf.log))
 		term = rf.currentTerm
-
-		rf.heartBeatTimer.Reset(0)
-		rf.persist()
 	}
 
 	return index, term, isLeader
@@ -742,13 +741,13 @@ func (rf *Raft) sendRequestVoteTo(peerId int, args *RequestVoteArgs) {
 		return
 	}
 	rf.mu.Unlock()
-	go func() {
+	go func(peerId int, args *RequestVoteArgs) {
 		reply := &RequestVoteReply{}
 		ok := rf.sendRequestVote(peerId, args, reply)
 		if ok {
 			rf.processRequestVoteReply(peerId, args, reply)
 		}
-	}()
+	}(peerId, args)
 }
 
 func (rf *Raft) sendHeartBeat() {
@@ -774,7 +773,7 @@ func (rf *Raft) sendHeartBeatTo(peerId int) {
 
 	if rf.nextIndex[peerId] <= rf.lastIncludedIndex {
 		// Send InstallSnapshotArgs
-		args := InstallSnapshotArgs{
+		args := &InstallSnapshotArgs{
 			Term:              rf.currentTerm,
 			LeaderId:          rf.me,
 			LastIncludedIndex: rf.lastIncludedIndex,
@@ -790,14 +789,14 @@ func (rf *Raft) sendHeartBeatTo(peerId int) {
 			if ok {
 				rf.processInstallSnapshot(peerId, args, reply)
 			}
-		}(peerId, &args)
+		}(peerId, args)
 	} else {
 		// Send AppendEntriesArgs
 		prevLogIndex, prevLogTerm := rf.nextIndex[peerId] - 1, rf.lastIncludedTerm
 		if prevLogIndex != rf.lastIncludedIndex {
 			prevLogTerm = rf.log[rf.index2offset(prevLogIndex)].Term
 		}
-		args := AppendEntriesArgs{
+		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIndex,
@@ -814,7 +813,7 @@ func (rf *Raft) sendHeartBeatTo(peerId int) {
 			if ok {
 				rf.processAppendEntriesReply(peerId, args, reply)
 			}
-		}(peerId, &args)
+		}(peerId, args)
 	}
 }
 

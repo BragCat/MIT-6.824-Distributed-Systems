@@ -1,5 +1,7 @@
 package shardmaster
 
+import "log"
+
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -16,6 +18,16 @@ package shardmaster
 //
 // You will need to add fields to the RPC argument structs.
 //
+
+
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 // The number of shards.
 const NShards = 10
@@ -36,6 +48,8 @@ func (config *Config) shuffle() {
 	}
 	shardsPerGroup := NShards / groupNum
 	extraShards := NShards % groupNum
+	DPrintf("[Config]: {%v} start shuffle, shardsPerGroup = %v, extraShards = %v.",
+		*config, shardsPerGroup, extraShards)
 
 	shuffleShards := make([]int, 0)
 	groupLoad := make(map[int]int)
@@ -59,7 +73,9 @@ func (config *Config) shuffle() {
 		}
 	}
 
-	for shard := range shuffleShards {
+	DPrintf("[Config]: shuffleShards = %v, groupLoad = %v", shuffleShards, groupLoad)
+
+	for _, shard := range shuffleShards {
 		for gid := range config.Groups {
 			if groupLoad[gid] < shardsPerGroup {
 				config.Shards[shard] = gid
@@ -73,6 +89,7 @@ func (config *Config) shuffle() {
 			}
 		}
 	}
+	DPrintf("[Config]: {%v} finish shuffle.", *config)
 }
 
 const (
