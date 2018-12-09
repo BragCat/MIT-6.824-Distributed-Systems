@@ -115,7 +115,7 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 //
-func (ck *Clerk) PutAppend(key string, value string, op string) {
+func (ck *Clerk) PutAppend(key string, value string, op OperationType) {
 
 	ck.mu.Lock()
 	defer ck.mu.Unlock()

@@ -1,6 +1,7 @@
 package shardkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"raft"
@@ -40,8 +41,8 @@ type GetResult struct {
 }
 
 type KeyValue struct {
-	key		string
-	value 	string
+	Key		string
+	Value 	string
 }
 
 type ShardStateMachine struct {
@@ -64,7 +65,7 @@ type ShardKV struct {
 
 	// Your definitions here.
 	pendingRequest		map[RequestIndex]*RequestResult
-	stateMachine  		map[int]ShardStateMachine
+	stateMachine  		[]ShardStateMachine
 	lastAppliedIndex	int
 	config				shardmaster.Config
 	persister 			*raft.Persister
@@ -171,10 +172,13 @@ func (kv *ShardKV) Kill() {
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
+func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
+	maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
+
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(KeyValue{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -185,7 +189,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.pendingRequest = make(map[RequestIndex]*RequestResult)
-	kv.stateMachine = make(map[int]ShardStateMachine)
+	kv.stateMachine = make([]ShardStateMachine, shardmaster.NShards)
+	for shard := 0; shard < shardmaster.NShards; shard++ {
+		kv.stateMachine[shard] = ShardStateMachine{
+			KVs:            make(map[string]string),
+			Sequence:       make(map[int64]int),
+			GetResultCache: make(map[int64]GetResult),
+			ShardId:        shard,
+			ConfigNum:      0,
+		}
+	}
 	kv.lastAppliedIndex	= -1
 	kv.config = shardmaster.Config{}
 	kv.persister = persister
@@ -208,8 +221,11 @@ func (kv *ShardKV) daemon() {
 	for {
 		select {
 		case applyMsg := <- kv.applyCh:
-			value := kv.apply(&applyMsg)
+			value, isSnapshot := kv.apply(&applyMsg)
 			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex, value)
+			if !isSnapshot {
+				kv.mayTakeSnapshot()
+			}
 		case <- kv.exitSignal:
 			return
 		}
@@ -217,9 +233,63 @@ func (kv *ShardKV) daemon() {
 }
 
 
-func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) string {
-	return ""
+func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (string, bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	value := ""
+	isSnapshot := !applyMsg.CommandValid
+	if !isSnapshot {
+		// Get or PutAppend
+		op, ok := applyMsg.Command.(Op)
+		if !ok {
+			panic("ApplyMsg.Command convert to Op fail!")
+		}
+
+		switch op.Operation {
+		case GET:
+			if op.Sequence < kv.stateMachine[op.ShardId].Sequence[op.CkId] {
+				value = kv.stateMachine[op.ShardId].GetResultCache[op.CkId].value
+			} else if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
+				value = kv.stateMachine[op.ShardId].KVs[op.Argument.(string)]
+				kv.stateMachine[op.ShardId].GetResultCache[op.CkId] = GetResult{
+					sequence:	op.Sequence,
+					value:		value,
+				}
+				kv.stateMachine[op.ShardId].Sequence[op.CkId]++
+			}
+		case PUT:
+			if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
+				keyValue := op.Argument.(KeyValue)
+				kv.stateMachine[op.ShardId].KVs[keyValue.Key] = keyValue.Value
+				kv.stateMachine[op.ShardId].Sequence[op.CkId]++
+			}
+		case APPEND:
+			if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
+				keyValue := op.Argument.(KeyValue)
+				kv.stateMachine[op.ShardId].KVs[keyValue.Key] += keyValue.Value
+				kv.stateMachine[op.ShardId].Sequence[op.CkId]++
+			}
+		}
+	} else {
+		// Snapshot
+		buffer := bytes.NewBuffer(applyMsg.Command.([]byte))
+		decoder := labgob.NewDecoder(buffer)
+		newSM := make([]ShardStateMachine, shardmaster.NShards)
+		var lastAppliedIndex int
+		if decoder.Decode(&newSM) != nil ||
+			decoder.Decode(&lastAppliedIndex) != nil {
+				panic("Decode snapshot error!")
+		} else {
+			if lastAppliedIndex > kv.lastAppliedIndex {
+				kv.stateMachine = newSM
+				kv.lastAppliedIndex = lastAppliedIndex
+			}
+		}
+	}
+	return value, isSnapshot
 }
+
 
 func (kv *ShardKV) cleanPendingRequests(term int, index int, value string) {
 	kv.mu.Lock()
@@ -235,4 +305,23 @@ func (kv *ShardKV) cleanPendingRequests(term int, index int, value string) {
 			delete(kv.pendingRequest, requestIndex)
 		}
 	}
+}
+
+func (kv *ShardKV) mayTakeSnapshot() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	threshold := kv.maxraftstate / 5 * 4
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() <= threshold {
+		return
+	}
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(kv.stateMachine)
+	encoder.Encode(kv.lastAppliedIndex)
+	data := buffer.Bytes()
+	go func(kv *ShardKV, data []byte, lastAppliedIndex int) {
+		kv.rf.TakeSnapshot(data, lastAppliedIndex)
+	}(kv, data, kv.lastAppliedIndex)
 }
