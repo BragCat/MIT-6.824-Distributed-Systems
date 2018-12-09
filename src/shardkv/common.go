@@ -12,18 +12,22 @@ import "time"
 //
 
 const (
-	TIMEOUT time.Duration	= 1000 * time.Millisecond
+	RequestTimeout 			= 1000 * time.Millisecond
+	ConfigUpdateTime		= 100 * time.Millisecond
+
+
 
 	PUT OperationType 		= "PUT"
 	APPEND OperationType	= "APPEND"
 	GET OperationType		= "GET"
+	NEWCONFIG OperationType	= "NEWCONFIG"
 
 	OK Err            		= "OK"
 	ErrNoKey Err      		= "ErrNoKey"
 	ErrWrongGroup Err 		= "ErrWrongGroup"
 	ErrRequestTimeout Err	= "ErrRequestTimeout"
 	ErrWrongLeader Err		= "ErrWrongLeader"
-	ErrApplyFail Err		= "ErrApplyFail"
+	ErrUnorderedSeq			= "ErrUnorderedSeq"
 )
 
 type Err string

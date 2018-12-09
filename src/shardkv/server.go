@@ -32,7 +32,7 @@ type RequestIndex struct {
 
 type RequestResult struct {
 	value  		string
-	pendingCh	chan bool
+	pendingCh	chan Err
 }
 
 type GetResult struct {
@@ -64,12 +64,14 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	mck					*shardmaster.Clerk
 	pendingRequest		map[RequestIndex]*RequestResult
 	stateMachine  		[]ShardStateMachine
 	lastAppliedIndex	int
 	config				shardmaster.Config
 	persister 			*raft.Persister
-	exitSignal			chan bool
+	applyDaemonExit		chan bool
+	configDaemonExit	chan bool
 }
 
 
@@ -112,7 +114,7 @@ func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
 	}
 	requestResult := RequestResult{
 		value:     "",
-		pendingCh: make(chan bool),
+		pendingCh: make(chan Err),
 	}
 
 	kv.mu.Lock()
@@ -120,13 +122,9 @@ func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
 	kv.mu.Unlock()
 
 	select {
-	case success := <- requestResult.pendingCh:
-		if success {
-			return true, OK, requestResult.value
-		} else {
-			return false, ErrApplyFail, ""
-		}
-	case <- time.After(TIMEOUT):
+	case err := <- requestResult.pendingCh:
+		return false, err, requestResult.value
+	case <- time.After(RequestTimeout):
 		return false, ErrRequestTimeout, ""
 	}
 }
@@ -140,9 +138,172 @@ func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
-	kv.exitSignal <- true
+	kv.applyDaemonExit <- true
+	kv.configDaemonExit <- true
 }
 
+
+
+func (kv *ShardKV) applyDaemon() {
+	for {
+		select {
+		case applyMsg := <- kv.applyCh:
+			value, err, isSnapshot := kv.apply(&applyMsg)
+			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex, value, err)
+			if !isSnapshot {
+				kv.mayTakeSnapshot()
+			}
+		case <- kv.applyDaemonExit:
+			return
+		}
+	}
+}
+
+
+func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (string, Err, bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	value := ""
+	err := OK
+	isSnapshot := !applyMsg.CommandValid
+	if !isSnapshot {
+		// Get or PutAppend
+		op, ok := applyMsg.Command.(Op)
+		if !ok {
+			panic("ApplyMsg.Command convert to Op fail!")
+		}
+
+		switch op.Operation {
+		case GET:
+			value, err = kv.applyGet(&op)
+		case PUT:
+			err = kv.applyPutAppend(&op)
+		case APPEND:
+			err = kv.applyPutAppend(&op)
+		case NEWCONFIG:
+			config := op.Argument.(shardmaster.Config)
+			err = kv.applyNewConfig(&config)
+		}
+	} else {
+		// Snapshot
+		buffer := bytes.NewBuffer(applyMsg.Command.([]byte))
+		decoder := labgob.NewDecoder(buffer)
+		newSM := make([]ShardStateMachine, shardmaster.NShards)
+		var lastAppliedIndex int
+		if decoder.Decode(&newSM) != nil ||
+			decoder.Decode(&lastAppliedIndex) != nil {
+			panic("Decode snapshot error!")
+		} else {
+			if lastAppliedIndex > kv.lastAppliedIndex {
+				kv.stateMachine = newSM
+				kv.lastAppliedIndex = lastAppliedIndex
+			}
+		}
+	}
+	return value, err, isSnapshot
+}
+
+func (kv *ShardKV) applyGet(op *Op) (string, Err) {
+	value := ""
+	err := OK
+	if op.Sequence < kv.stateMachine[op.ShardId].Sequence[op.CkId] {
+		value = kv.stateMachine[op.ShardId].GetResultCache[op.CkId].value
+	} else if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
+		value = kv.stateMachine[op.ShardId].KVs[op.Argument.(string)]
+		kv.stateMachine[op.ShardId].GetResultCache[op.CkId] = GetResult{
+			sequence:	op.Sequence,
+			value:		value,
+		}
+		kv.stateMachine[op.ShardId].Sequence[op.CkId]++
+	} else {
+		err = ErrUnorderedSeq
+	}
+	return value, err
+}
+
+func (kv *ShardKV) applyPutAppend(op *Op) Err {
+	err := OK
+	if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
+		keyValue := op.Argument.(KeyValue)
+		if op.Operation == PUT {
+			kv.stateMachine[op.ShardId].KVs[keyValue.Key] = keyValue.Value
+		} else {
+			kv.stateMachine[op.ShardId].KVs[keyValue.Key] += keyValue.Value
+		}
+		kv.stateMachine[op.ShardId].Sequence[op.CkId]++
+	}
+	return err
+}
+
+func (kv *ShardKV) applyNewConfig(config *shardmaster.Config) Err {
+	return OK
+}
+
+
+
+func (kv *ShardKV) cleanPendingRequests(term int, index int, value string, err Err) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	for requestIndex, requestResult := range kv.pendingRequest {
+		if requestIndex.term < term || (requestIndex.term == term && requestIndex.index < index) {
+			requestResult.pendingCh <- err
+			delete(kv.pendingRequest, requestIndex)
+		} else if requestIndex.term == term && requestIndex.index == index {
+			requestResult.value = value
+			requestResult.pendingCh <- err
+			delete(kv.pendingRequest, requestIndex)
+		}
+	}
+}
+
+func (kv *ShardKV) mayTakeSnapshot() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	threshold := kv.maxraftstate / 5 * 4
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() <= threshold {
+		return
+	}
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(kv.stateMachine)
+	encoder.Encode(kv.lastAppliedIndex)
+	data := buffer.Bytes()
+	go func(kv *ShardKV, data []byte, lastAppliedIndex int) {
+		kv.rf.TakeSnapshot(data, lastAppliedIndex)
+	}(kv, data, kv.lastAppliedIndex)
+}
+
+
+func (kv *ShardKV) configDaemon() {
+	for {
+		select {
+		case <- time.After(ConfigUpdateTime):
+			_, isLeader := kv.rf.GetState()
+			if isLeader {
+				kv.mu.Lock()
+				currentConfigNum := kv.config.Num
+				kv.mu.Unlock()
+
+				newConfig := kv.mck.Query(currentConfigNum + 1)
+				op := Op{
+					Operation: NEWCONFIG,
+					Argument:  newConfig,
+					CkId:      0,
+					ShardId:   0,
+					Sequence:  0,
+				}
+				kv.rf.Start(op)
+			}
+			return
+		case <- kv.configDaemonExit:
+			return
+		}
+	}
+}
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -202,126 +363,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastAppliedIndex	= -1
 	kv.config = shardmaster.Config{}
 	kv.persister = persister
-	kv.exitSignal = make(chan bool)
+	kv.applyDaemonExit = make(chan bool)
+	kv.configDaemonExit = make(chan bool)
 
 
 	// Use something like this to talk to the shardmaster:
-	// kv.mck = shardmaster.MakeClerk(kv.masters)
+	kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	go kv.daemon()
+	go kv.applyDaemon()
+	go kv.configDaemon()
 
 	return kv
-}
-
-
-func (kv *ShardKV) daemon() {
-	for {
-		select {
-		case applyMsg := <- kv.applyCh:
-			value, isSnapshot := kv.apply(&applyMsg)
-			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex, value)
-			if !isSnapshot {
-				kv.mayTakeSnapshot()
-			}
-		case <- kv.exitSignal:
-			return
-		}
-	}
-}
-
-
-func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (string, bool) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	value := ""
-	isSnapshot := !applyMsg.CommandValid
-	if !isSnapshot {
-		// Get or PutAppend
-		op, ok := applyMsg.Command.(Op)
-		if !ok {
-			panic("ApplyMsg.Command convert to Op fail!")
-		}
-
-		switch op.Operation {
-		case GET:
-			if op.Sequence < kv.stateMachine[op.ShardId].Sequence[op.CkId] {
-				value = kv.stateMachine[op.ShardId].GetResultCache[op.CkId].value
-			} else if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
-				value = kv.stateMachine[op.ShardId].KVs[op.Argument.(string)]
-				kv.stateMachine[op.ShardId].GetResultCache[op.CkId] = GetResult{
-					sequence:	op.Sequence,
-					value:		value,
-				}
-				kv.stateMachine[op.ShardId].Sequence[op.CkId]++
-			}
-		case PUT:
-			if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
-				keyValue := op.Argument.(KeyValue)
-				kv.stateMachine[op.ShardId].KVs[keyValue.Key] = keyValue.Value
-				kv.stateMachine[op.ShardId].Sequence[op.CkId]++
-			}
-		case APPEND:
-			if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
-				keyValue := op.Argument.(KeyValue)
-				kv.stateMachine[op.ShardId].KVs[keyValue.Key] += keyValue.Value
-				kv.stateMachine[op.ShardId].Sequence[op.CkId]++
-			}
-		}
-	} else {
-		// Snapshot
-		buffer := bytes.NewBuffer(applyMsg.Command.([]byte))
-		decoder := labgob.NewDecoder(buffer)
-		newSM := make([]ShardStateMachine, shardmaster.NShards)
-		var lastAppliedIndex int
-		if decoder.Decode(&newSM) != nil ||
-			decoder.Decode(&lastAppliedIndex) != nil {
-				panic("Decode snapshot error!")
-		} else {
-			if lastAppliedIndex > kv.lastAppliedIndex {
-				kv.stateMachine = newSM
-				kv.lastAppliedIndex = lastAppliedIndex
-			}
-		}
-	}
-	return value, isSnapshot
-}
-
-
-func (kv *ShardKV) cleanPendingRequests(term int, index int, value string) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	for requestIndex, requestResult := range kv.pendingRequest {
-		if requestIndex.term < term || (requestIndex.term == term && requestIndex.index < index) {
-			requestResult.pendingCh <- false
-			delete(kv.pendingRequest, requestIndex)
-		} else if requestIndex.term == term && requestIndex.index == index {
-			requestResult.value = value
-			requestResult.pendingCh <- true
-			delete(kv.pendingRequest, requestIndex)
-		}
-	}
-}
-
-func (kv *ShardKV) mayTakeSnapshot() {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	threshold := kv.maxraftstate / 5 * 4
-	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() <= threshold {
-		return
-	}
-
-	buffer := new(bytes.Buffer)
-	encoder := labgob.NewEncoder(buffer)
-	encoder.Encode(kv.stateMachine)
-	encoder.Encode(kv.lastAppliedIndex)
-	data := buffer.Bytes()
-	go func(kv *ShardKV, data []byte, lastAppliedIndex int) {
-		kv.rf.TakeSnapshot(data, lastAppliedIndex)
-	}(kv, data, kv.lastAppliedIndex)
 }
