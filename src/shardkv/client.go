@@ -44,6 +44,7 @@ type Clerk struct {
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
 	id 			int64
+	// Every shard a sequence to make request to different shard won't be delayed
 	sequence	[]int
 	mu 			sync.Mutex
 }
@@ -79,9 +80,10 @@ func (ck *Clerk) Get(key string) string {
 
 	shard := key2shard(key)
 	args := GetArgs{
-		Key:      key,
-		CkId:     ck.id,
-		Sequence: ck.sequence[shard],
+		Key:     	key,
+		CkId:     	ck.id,
+		ShardId:	shard,
+		Sequence: 	ck.sequence[shard],
 	}
 	ck.sequence[shard]++
 
@@ -124,6 +126,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Value: 		value,
 		Op:    		op,
 		CkId:		ck.id,
+		ShardId:	shard,
 		Sequence:	ck.sequence[shard],
 	}
 	ck.sequence[shard]++

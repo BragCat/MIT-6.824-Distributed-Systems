@@ -1,5 +1,7 @@
 package shardkv
 
+import "time"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running op-at-a-time paxos.
@@ -10,27 +12,34 @@ package shardkv
 //
 
 const (
-	PUT				= "PUT"
-	APPEND		  	= "APPEND"
-	GET				= "GET"
+	TIMEOUT time.Duration	= 1000 * time.Millisecond
 
-	OK            	= "OK"
-	ErrNoKey      	= "ErrNoKey"
-	ErrWrongGroup 	= "ErrWrongGroup"
+	PUT OperationType 		= "PUT"
+	APPEND OperationType	= "APPEND"
+	GET OperationType		= "GET"
+
+	OK Err            		= "OK"
+	ErrNoKey Err      		= "ErrNoKey"
+	ErrWrongGroup Err 		= "ErrWrongGroup"
+	ErrRequestTimeout Err	= "ErrRequestTimeout"
+	ErrWrongLeader Err		= "ErrWrongLeader"
+	ErrApplyFail Err		= "ErrApplyFail"
 )
 
 type Err string
+type OperationType string
 
 // Put or Append
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	Key   string
 	Value string
-	Op    string // "Put" or "Append"
+	Op    OperationType // "Put" or "Append"
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	CkId		int64
+	ShardId		int
 	Sequence	int
 }
 
@@ -43,6 +52,7 @@ type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
 	CkId		int64
+	ShardId		int
 	Sequence	int
 }
 

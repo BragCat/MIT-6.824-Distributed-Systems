@@ -1,18 +1,55 @@
 package shardkv
 
+import (
+	"labgob"
+	"labrpc"
+	"raft"
+	"shardmaster"
+	"sync"
+	"time"
+)
+
 
 // import "shardmaster"
-import "labrpc"
-import "raft"
-import "sync"
-import "labgob"
-
 
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Operation 	OperationType
+	Argument	interface{}
+	CkId		int64
+	ShardId		int
+	Sequence	int
+}
+
+type RequestIndex struct {
+	term	int
+	index 	int
+}
+
+type RequestResult struct {
+	value  		string
+	pendingCh	chan bool
+}
+
+type GetResult struct {
+	sequence	int
+	value 		string
+}
+
+type KeyValue struct {
+	key		string
+	value 	string
+}
+
+type ShardStateMachine struct {
+	KVs					map[string]string
+	Sequence			map[int64]int
+	GetResultCache		map[int64]GetResult
+	ShardId				int
+	ConfigNum			int
 }
 
 type ShardKV struct {
@@ -26,26 +63,83 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	pendingRequest		map[RequestIndex]*RequestResult
+	stateMachine  		map[int]ShardStateMachine
+	lastAppliedIndex	int
+	config				shardmaster.Config
+	persister 			*raft.Persister
+	exitSignal			chan bool
 }
 
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		Operation:	GET,
+		Argument:	args.Key,
+		CkId:		args.CkId,
+		ShardId:	args.ShardId,
+		Sequence:	args.Sequence,
+	}
+
+	reply.WrongLeader, reply.Err, reply.Value = kv.sendCommand(&op)
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		Operation:	args.Op,
+		Argument:	KeyValue{args.Key, args.Value},
+		CkId:		args.CkId,
+		ShardId:	args.ShardId,
+		Sequence:	args.Sequence,
+	}
+
+	reply.WrongLeader, reply.Err, _ = kv.sendCommand(&op)
+}
+
+func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
+	index, term, isLeader := kv.rf.Start(*op)
+
+	if !isLeader {
+		return true, ErrWrongLeader, ""
+	}
+
+	requestIndex := RequestIndex{
+		term:  term,
+		index: index,
+	}
+	requestResult := RequestResult{
+		value:     "",
+		pendingCh: make(chan bool),
+	}
+
+	kv.mu.Lock()
+	kv.pendingRequest[requestIndex] = &requestResult
+	kv.mu.Unlock()
+
+	select {
+	case success := <- requestResult.pendingCh:
+		if success {
+			return true, OK, requestResult.value
+		} else {
+			return false, ErrApplyFail, ""
+		}
+	case <- time.After(TIMEOUT):
+		return false, ErrRequestTimeout, ""
+	}
 }
 
 //
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
+// in Kill(), but it might be convenient td (for example)
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.exitSignal <- true
 }
 
 
@@ -90,6 +184,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
+	kv.pendingRequest = make(map[RequestIndex]*RequestResult)
+	kv.stateMachine = make(map[int]ShardStateMachine)
+	kv.lastAppliedIndex	= -1
+	kv.config = shardmaster.Config{}
+	kv.persister = persister
+	kv.exitSignal = make(chan bool)
+
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
@@ -97,6 +198,41 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go kv.daemon()
 
 	return kv
+}
+
+
+func (kv *ShardKV) daemon() {
+	for {
+		select {
+		case applyMsg := <- kv.applyCh:
+			value := kv.apply(&applyMsg)
+			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex, value)
+		case <- kv.exitSignal:
+			return
+		}
+	}
+}
+
+
+func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) string {
+	return ""
+}
+
+func (kv *ShardKV) cleanPendingRequests(term int, index int, value string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	for requestIndex, requestResult := range kv.pendingRequest {
+		if requestIndex.term < term || (requestIndex.term == term && requestIndex.index < index) {
+			requestResult.pendingCh <- false
+			delete(kv.pendingRequest, requestIndex)
+		} else if requestIndex.term == term && requestIndex.index == index {
+			requestResult.value = value
+			requestResult.pendingCh <- true
+			delete(kv.pendingRequest, requestIndex)
+		}
+	}
 }
