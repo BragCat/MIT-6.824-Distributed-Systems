@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
+
 export GOPATH=${PWD}
+
 test_dir=("mapreduce" "raft" "kvraft" "shardmaster")
+
 for dir_name in ${test_dir[@]};
 do
     echo "Test in "${dir_name}
