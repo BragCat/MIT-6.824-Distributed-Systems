@@ -39,9 +39,9 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardmaster.Clerk
-	config   shardmaster.Config
-	make_end func(string) *labrpc.ClientEnd
+	sm       	*shardmaster.Clerk
+	config   	shardmaster.Config
+	make_end 	func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
 	id 			int64
 	// Every shard a sequence to make request to different shard won't be delayed

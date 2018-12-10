@@ -54,14 +54,14 @@ type ShardStateMachine struct {
 }
 
 type ShardKV struct {
-	mu           sync.Mutex
-	me           int
-	rf           *raft.Raft
-	applyCh      chan raft.ApplyMsg
-	make_end     func(string) *labrpc.ClientEnd
-	gid          int
-	masters      []*labrpc.ClientEnd
-	maxraftstate int // snapshot if log grows this big
+	mu           		sync.Mutex
+	me           		int
+	rf           		*raft.Raft
+	applyCh      		chan raft.ApplyMsg
+	make_end     		func(string) *labrpc.ClientEnd
+	gid          		int
+	masters      		[]*labrpc.ClientEnd
+	maxraftstate 		int // snapshot if log grows this big
 
 	// Your definitions here.
 	mck					*shardmaster.Clerk
@@ -108,6 +108,8 @@ func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
 		return true, ErrWrongLeader, ""
 	}
 
+	DPrintf("[ShardKV %v, GID %v]: send command %v.",
+		kv.me, kv.gid, *op)
 	requestIndex := RequestIndex{
 		term:  term,
 		index: index,
@@ -123,8 +125,12 @@ func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
 
 	select {
 	case err := <- requestResult.pendingCh:
+		DPrintf("[ShardKV %v, GID %v]: reply {wrongLeader = %v, err = %v, value = %v} to command %v",
+			kv.me, kv.gid, false, err, requestResult.value, *op)
 		return false, err, requestResult.value
 	case <- time.After(RequestTimeout):
+		DPrintf("[ShardKV %v, GID %v]: reply {wrongLeader = %v, err = %v, value = %v} to command %v",
+			kv.me, kv.gid, false, ErrRequestTimeout, requestResult.value, *op)
 		return false, ErrRequestTimeout, ""
 	}
 }
@@ -148,6 +154,8 @@ func (kv *ShardKV) applyDaemon() {
 	for {
 		select {
 		case applyMsg := <- kv.applyCh:
+			DPrintf("[ShardKV %v, GID %v]: receive ApplyMsg %v.",
+				kv.me, kv.gid, applyMsg)
 			value, err, isSnapshot := kv.apply(&applyMsg)
 			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex, value, err)
 			if !isSnapshot {
@@ -205,6 +213,8 @@ func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (string, Err, bool) {
 }
 
 func (kv *ShardKV) applyGet(op *Op) (string, Err) {
+	DPrintf("[ShardKV %v, GID %v]: apply Get command %v",
+		kv.me, kv.gid, *op)
 	value := ""
 	err := OK
 	if op.Sequence < kv.stateMachine[op.ShardId].Sequence[op.CkId] {
@@ -223,7 +233,13 @@ func (kv *ShardKV) applyGet(op *Op) (string, Err) {
 }
 
 func (kv *ShardKV) applyPutAppend(op *Op) Err {
+	DPrintf("[ShardKV %v, GID %v]: apply PutAppend command %v",
+		kv.me, kv.gid, *op)
 	err := OK
+	if kv.config.Shards[op.ShardId] != kv.gid {
+		err := ErrWrongGroup
+		return err
+	}
 	if op.Sequence == kv.stateMachine[op.ShardId].Sequence[op.CkId] {
 		keyValue := op.Argument.(KeyValue)
 		if op.Operation == PUT {
@@ -236,7 +252,35 @@ func (kv *ShardKV) applyPutAppend(op *Op) Err {
 	return err
 }
 
-func (kv *ShardKV) applyNewConfig(config *shardmaster.Config) Err {
+func (kv *ShardKV) applyNewConfig(newConfig *shardmaster.Config) Err {
+	DPrintf("[ShardKV %v, GID %v]: current config is %v, apply new config %v.",
+		kv.me, kv.gid, kv.config, *newConfig)
+	if newConfig.Num <= kv.config.Num {
+		return OK
+	}
+
+	if newConfig.Num > kv.config.Num + 1 {
+		panic("Config num is not continuous!")
+	}
+
+	for shard, gid := range newConfig.Shards {
+		if gid == kv.gid {
+			if kv.config.Shards[shard] == kv.gid {
+				kv.stateMachine[shard].ConfigNum = newConfig.Num
+			} else {
+				kv.stateMachine[shard] = ShardStateMachine{
+					KVs:            make(map[string]string),
+					Sequence:       make(map[int64]int),
+					GetResultCache: make(map[int64]GetResult),
+					ShardId:        shard,
+					ConfigNum:      newConfig.Num,
+				}
+			}
+		}
+	}
+	kv.config = *newConfig
+	DPrintf("[ShardKV %v, GID %v]: after apply, the current config is %v",
+		kv.me, kv.gid, kv.config)
 	return OK
 }
 
@@ -288,7 +332,10 @@ func (kv *ShardKV) configDaemon() {
 				currentConfigNum := kv.config.Num
 				kv.mu.Unlock()
 
-				newConfig := kv.mck.Query(currentConfigNum + 1)
+				newConfig := kv.mck.Query(-1)
+				if newConfig.Num > currentConfigNum + 1 {
+					newConfig = kv.mck.Query(currentConfigNum + 1)
+				}
 				op := Op{
 					Operation: NEWCONFIG,
 					Argument:  newConfig,
@@ -296,9 +343,10 @@ func (kv *ShardKV) configDaemon() {
 					ShardId:   0,
 					Sequence:  0,
 				}
+				DPrintf("[ShardKV %v, GID %v]: current config is %v, get new config %v, send command %v.",
+					kv.me, kv.gid, kv.config, newConfig, op)
 				kv.rf.Start(op)
 			}
-			return
 		case <- kv.configDaemonExit:
 			return
 		}
@@ -340,6 +388,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 	labgob.Register(KeyValue{})
+	labgob.Register(shardmaster.Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -361,7 +410,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		}
 	}
 	kv.lastAppliedIndex	= -1
-	kv.config = shardmaster.Config{}
+	kv.config = shardmaster.Config{
+		Num:    -1,
+		Shards: [shardmaster.NShards]int{},
+		Groups: make(map[int][]string),
+	}
 	kv.persister = persister
 	kv.applyDaemonExit = make(chan bool)
 	kv.configDaemonExit = make(chan bool)
