@@ -14,7 +14,7 @@ import (
 // You will have to modify these definitions.
 //
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -24,21 +24,28 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const (
-	RequestTimeout 				= 1000 * time.Millisecond
-	ConfigUpdateTime			= 100 * time.Millisecond
+	RequestTimeout 					= 1000 * time.Millisecond
+	ConfigUpdateTime				= 100 * time.Millisecond
+	ShardPullTime					= 50 * time.Millisecond
+	ShardCleanTime					= 50 * time.Millisecond
 
 
-	PUT 		OperationType 	= "PUT"
-	APPEND 		OperationType 	= "APPEND"
-	GET 		OperationType 	= "GET"
-	NEWCONFIG 	OperationType 	= "NEWCONFIG"
 
-	OK 					Err 	= "OK"
-	ErrNoKey 			Err 	= "ErrNoKey"
-	ErrWrongGroup 		Err 	= "ErrWrongGroup"
-	ErrRequestTimeout 	Err		= "ErrRequestTimeout"
-	ErrWrongLeader 		Err		= "ErrWrongLeader"
-	ErrUnorderedSeq		Err		= "ErrUnorderedSeq"
+	PUT 			OperationType 	= "PUT"
+	APPEND 			OperationType 	= "APPEND"
+	GET 			OperationType 	= "GET"
+	NEWCONFIG 		OperationType 	= "NEWCONFIG"
+	INSTALLCONFIG	OperationType 	= "INSTALLCONFIG"
+	INSTALLSHARD	OperationType 	= "INSTALLSHARD"
+	CLEANSHARD		OperationType 	= "CLEANSHARD"
+	REMOVESHARD 	OperationType 	= "REMOVESHARD"
+
+	OK 						Err 	= "OK"
+	ErrNoKey 				Err 	= "ErrNoKey"
+	ErrRetry				Err		= "ErrRetry"
+	ErrWrongGroup 			Err 	= "ErrWrongGroup"
+	ErrWrongLeader 			Err		= "ErrWrongLeader"
+	ErrInstallStaleConfig	Err		= "ErrInstallStaleConfig"
 )
 
 type Err string
