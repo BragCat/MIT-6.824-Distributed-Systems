@@ -490,11 +490,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 		if args.LastIncludedIndex > rf.lastIncludedIndex {
 			lastIncludedOffset := rf.index2offset(args.LastIncludedIndex)
-			if lastIncludedOffset >= len(rf.log)-1 {
+			if lastIncludedOffset >= len(rf.log) - 1 {
 				rf.log = make([]Entry, 0)
 			} else {
 				if rf.log[lastIncludedOffset].Term == rf.lastIncludedTerm {
-					rf.log = append([]Entry{}, rf.log[lastIncludedOffset+1:]...)
+					rf.log = append([]Entry{}, rf.log[lastIncludedOffset + 1 : ]...)
 				} else {
 					rf.log = make([]Entry, 0)
 				}
@@ -528,13 +528,8 @@ func (rf *Raft) processInstallSnapshot(peerId int, args *InstallSnapshotArgs, re
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm || reply.Term < rf.currentTerm || rf.state != leader {
-		return
-	}
-
 	if reply.Term > rf.currentTerm {
 		rf.setToFollower(reply.Term)
-		return
 	}
 
 	rf.nextIndex[peerId] = max(rf.nextIndex[peerId], args.LastIncludedIndex + 1)
@@ -548,7 +543,6 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
 	if lastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-
 
 	lastIncludedOffset := rf.index2offset(lastIncludedIndex)
 

@@ -85,7 +85,6 @@ func (ck *Clerk) Get(key string) string {
 		ShardId:	shard,
 		Sequence: 	ck.sequence[shard],
 	}
-	ck.sequence[shard]++
 
 	for {
 		gid := ck.config.Shards[shard]
@@ -96,6 +95,7 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.sequence[shard]++
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -129,7 +129,6 @@ func (ck *Clerk) PutAppend(key string, value string, op OperationType) {
 		ShardId:	shard,
 		Sequence:	ck.sequence[shard],
 	}
-	ck.sequence[shard]++
 
 	for {
 		gid := ck.config.Shards[shard]
@@ -139,6 +138,7 @@ func (ck *Clerk) PutAppend(key string, value string, op OperationType) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.WrongLeader == false && reply.Err == OK {
+					ck.sequence[shard]++
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
