@@ -2,7 +2,7 @@
 
 export GOPATH=${PWD}
 
-test_dir=("mapreduce" "raft" "kvraft" "shardmaster")
+test_dir=("mapreduce" "raft" "kvraft" "shardmaster" "shardkv")
 
 for dir_name in ${test_dir[@]};
 do

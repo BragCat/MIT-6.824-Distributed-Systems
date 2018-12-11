@@ -10,8 +10,21 @@ import (
 	"time"
 )
 
+const (
+	RequestTimeout 					= 1000 * time.Millisecond
+	ConfigUpdateTime				= 100 * time.Millisecond
+	ShardPullTime					= 50 * time.Millisecond
+	ShardCleanTime					= 50 * time.Millisecond
 
-// import "shardmaster"
+
+	GET 			OperationType 	= "GET"
+	PUTAPPEND		OperationType   = "PUTAPPEND"
+	NEWCONFIG 		OperationType 	= "NEWCONFIG"
+	INSTALLCONFIG	OperationType 	= "INSTALLCONFIG"
+	INSTALLSHARD	OperationType 	= "INSTALLSHARD"
+	CLEANSHARD		OperationType 	= "CLEANSHARD"
+	REMOVESHARD 	OperationType 	= "REMOVESHARD"
+)
 
 
 type Op struct {
@@ -20,9 +33,6 @@ type Op struct {
 	// otherwise RPC will break.
 	Operation 	OperationType
 	Argument	interface{}
-	CkId		int64
-	ShardId		int
-	Sequence	int
 }
 
 type RequestIndex struct {
@@ -32,18 +42,14 @@ type RequestIndex struct {
 
 type RequestResult struct {
 	value  		string
-	pendingCh	chan Err
+	pendingCh	chan struct{}
+	err 		Err
 }
 
 type GetResult struct {
 	Sequence	int
 	Value 		string
 	Err			Err
-}
-
-type KeyValue struct {
-	Key		string
-	Value 	string
 }
 
 type ShardIndex struct {
@@ -90,21 +96,23 @@ type ShardKV struct {
 
 	// Your definitions here.
 	mck						*shardmaster.Clerk
-	pendingRequest			map[RequestIndex]*RequestResult
-	stateMachine  			map[int]*ShardStateMachine
-	lastAppliedIndex		int
 	previousConfig			shardmaster.Config
 	config					shardmaster.Config
 	configInstalled			bool
+
 	pullShardSet			map[ShardIndex][]string
 	cleanShardSet			map[ShardIndex][]string
 
+	stateMachine  			map[int]*ShardStateMachine
+	pendingRequests			map[RequestIndex]*RequestResult
+	lastAppliedIndex		int
 
 	persister 				*raft.Persister
-	applyDaemonExit			chan bool
-	configDaemonExit		chan bool
-	pullShardDaemonExit 	chan bool
-	cleanShardDaemonExit	chan bool
+
+	applyDaemonExitCh		chan bool
+	configDaemonExitCh		chan bool
+	pullShardDaemonExitCh	chan bool
+	cleanShardDaemonExitCh	chan bool
 }
 
 
@@ -112,34 +120,26 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	op := Op{
 		Operation:	GET,
-		Argument:	args.Key,
-		CkId:		args.CkId,
-		ShardId:	args.ShardId,
-		Sequence:	args.Sequence,
+		Argument:	*args,
 	}
 
-	reply.WrongLeader, reply.Err, reply.Value = kv.sendCommand(&op)
+	reply.WrongLeader, reply.Value, reply.Err = kv.sendCommand(&op)
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	op := Op{
-		Operation:	args.Op,
-		Argument:	KeyValue{args.Key, args.Value},
-		CkId:		args.CkId,
-		ShardId:	args.ShardId,
-		Sequence:	args.Sequence,
+		Operation:	PUTAPPEND,
+		Argument:	*args,
 	}
 
-	reply.WrongLeader, reply.Err, _ = kv.sendCommand(&op)
+	reply.WrongLeader, _, reply.Err = kv.sendCommand(&op)
 }
 
 func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// If current node's configuration number is larger than request one, then this node won't receive any write for
-	// that shard with that configuration
 	if kv.config.Num > args.ConfigNum {
 		if _, exist := kv.stateMachine[args.ShardId]; exist {
 			if kv.stateMachine[args.ShardId].ConfigNum != args.ConfigNum {
@@ -165,7 +165,6 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 				}
 			}
 		} else {
-			// Current group doesn't pull this shard from other group or its already been purned
 			reply.Success = false
 		}
 	} else {
@@ -177,23 +176,21 @@ func (kv *ShardKV) CleanShard(args *CleanShardArgs, reply *CleanShardReply) {
 	op := Op{
 		Operation: CLEANSHARD,
 		Argument:  *args,
-		CkId:      0,
-		ShardId:   0,
-		Sequence:  0,
 	}
-	wrongLeader, err, _ := kv.sendCommand(&op)
+	wrongLeader, _, err := kv.sendCommand(&op)
 
 	reply.Success = !wrongLeader && err == OK
 }
 
-func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
-	DPrintf("[ShardKV %v, GID %v]: send command %v.",
+func (kv *ShardKV) sendCommand(op *Op) (bool, string, Err) {
+
+	DPrintf("[ShardKV %v, GID %v][sendCommand]: send command %v.",
 		kv.me, kv.gid, *op)
 	index, term, isLeader := kv.rf.Start(*op)
 	index--
 
 	if !isLeader {
-		return true, ErrWrongLeader, ""
+		return true, "", ErrWrongLeader
 	}
 
 	requestIndex := RequestIndex{
@@ -201,23 +198,22 @@ func (kv *ShardKV) sendCommand(op *Op) (bool, Err, string) {
 		index: index,
 	}
 	requestResult := RequestResult{
-		value:     "",
-		pendingCh: make(chan Err),
+		pendingCh: make(chan struct{}, 0),
 	}
 
 	kv.mu.Lock()
-	kv.pendingRequest[requestIndex] = &requestResult
+	kv.pendingRequests[requestIndex] = &requestResult
 	kv.mu.Unlock()
 
 	select {
-	case err := <- requestResult.pendingCh:
-		DPrintf("[ShardKV %v, GID %v]: reply {wrongLeader = %v, err = %v, value = %v} to command %v",
-			kv.me, kv.gid, false, err, requestResult.value, *op)
-		return false, err, requestResult.value
+	case <- requestResult.pendingCh:
+		DPrintf("[ShardKV %v, GID %v][sendCommand]: reply {err = %v, value = %v} to command %v",
+			kv.me, kv.gid, requestResult.err, requestResult.value, *op)
+		return false, requestResult.value, requestResult.err
 	case <- time.After(RequestTimeout):
-		DPrintf("[ShardKV %v, GID %v]: reply {wrongLeader = %v, err = %v, value = %v} to command %v",
-			kv.me, kv.gid, false, ErrRetry, requestResult.value, *op)
-		return false, ErrRetry, ""
+		DPrintf("[ShardKV %v, GID %v][sendCommand]: reply {err = %v, value = %v} to command %v",
+			kv.me, kv.gid, ErrRetry, requestResult.value, *op)
+		return false, "", ErrRetry
 	}
 }
 
@@ -225,29 +221,30 @@ func (kv *ShardKV) applyDaemon() {
 	for {
 		select {
 		case applyMsg := <- kv.applyCh:
-			DPrintf("[ShardKV %v, GID %v]: receive ApplyMsg %v.",
+
+			DPrintf("[ShardKV %v, GID %v][applyDaemon]: receive ApplyMsg %v.",
 				kv.me, kv.gid, applyMsg)
-			value, err, isSnapshot := kv.apply(&applyMsg)
-			kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex - 1, value, err)
-			if !isSnapshot {
+
+			value, err := kv.apply(&applyMsg)
+			if applyMsg.CommandValid {
+				kv.cleanPendingRequests(applyMsg.CommandTerm, applyMsg.CommandIndex - 1, value, err)
 				kv.mayTakeSnapshot()
 			}
-		case <- kv.applyDaemonExit:
+		case <- kv.applyDaemonExitCh:
 			return
 		}
 	}
 }
 
-func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (string, Err, bool) {
+func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (result string, err Err) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	value := ""
-	err := OK
-	isSnapshot := !applyMsg.CommandValid
+	result = ""
+	err = OK
 
-	if !isSnapshot {
+	if applyMsg.CommandValid {
 		// Get or PutAppend
 		if applyMsg.CommandIndex - 1 != kv.lastAppliedIndex + 1 {
 			panic("ApplyMsg index is not continuous!")
@@ -261,27 +258,44 @@ func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (string, Err, bool) {
 
 		switch op.Operation {
 		case GET:
-			value, err = kv.applyGet(&op)
-		case PUT:
-			err = kv.applyPutAppend(&op)
-		case APPEND:
-			err = kv.applyPutAppend(&op)
+			args := op.Argument.(GetArgs)
+			result, err = kv.applyGetPutAppend(args.CkId, args.Sequence, args.Key, "", GET)
+
+		case PUTAPPEND:
+			args := op.Argument.(PutAppendArgs)
+			result, err = kv.applyGetPutAppend(args.CkId, args.Sequence, args.Key, args.Value, args.Op)
+
 		case NEWCONFIG:
-			err = kv.applyNewConfig(&op)
+			config := op.Argument.(shardmaster.Config)
+			kv.applyNewConfig(&config)
+
 		case INSTALLCONFIG:
-			err = kv.installConfig(&op)
+			configNum := op.Argument.(int)
+			kv.installConfig(configNum)
+
 		case INSTALLSHARD:
-			err = kv.installShard(&op)
+			shardSM := op.Argument.(ShardStateMachine)
+			kv.installShard(&shardSM)
+
 		case CLEANSHARD:
-			err = kv.cleanShard(&op)
+			args := op.Argument.(CleanShardArgs)
+			if !kv.cleanShard(&args) {
+				err = ErrRetry
+			}
+
 		case REMOVESHARD:
-			args := op.Argument.(ShardIndex)
-			delete(kv.cleanShardSet, args)
+			shardIndex := op.Argument.(ShardIndex)
+			delete(kv.cleanShardSet, shardIndex)
+
 		default:
 			panic("Unknown command!")
 		}
 	} else {
 		// Snapshot
+
+		DPrintf("[ShardKV %v, GID %v][apply]: apply snapshot.",
+			kv.me, kv.gid)
+
 		buffer := bytes.NewBuffer(applyMsg.Command.([]byte))
 		decoder := labgob.NewDecoder(buffer)
 		var previousConfig, config shardmaster.Config
@@ -310,95 +324,73 @@ func (kv *ShardKV) apply(applyMsg *raft.ApplyMsg) (string, Err, bool) {
 			}
 		}
 	}
-	return value, err, isSnapshot
+	return result, err
 }
 
-func (kv *ShardKV) applyGet(op *Op) (string, Err) {
-	DPrintf("[ShardKV %v, GID %v]: apply Get command %v",
-		kv.me, kv.gid, *op)
-	value := ""
+func (kv *ShardKV) applyGetPutAppend(ckId int64, sequence int, key string, value string,
+	opType OperationType) (string, Err) {
+
+	shardId := key2shard(key)
+	result := ""
 	err := OK
-	if kv.config.Shards[op.ShardId] != kv.gid {
+
+	if kv.config.Shards[shardId] != kv.gid {
 		err = ErrWrongGroup
-		return value, err
+		return result, err
 	}
 
-	_, exist := kv.pullShardSet[ShardIndex{kv.previousConfig.Num, op.ShardId}]
+	DPrintf("[ShardKV %v, GID %v][ApplyGetPutAppend]: apply Get/PutAppend command {%v, %v}.",
+		kv.me, kv.gid, key, value)
+
+	_, exist := kv.pullShardSet[ShardIndex{kv.previousConfig.Num, shardId}]
 	if exist {
 		err = ErrRetry
-		return value, err
+		return result, err
 	}
 
-	shardSM := kv.stateMachine[op.ShardId]
-	if op.Sequence < shardSM.Sequence[op.CkId] {
+	shardSM := kv.stateMachine[shardId]
+	if sequence < shardSM.Sequence[ckId] {
 
-		if op.Sequence != shardSM.GetResultCache[op.CkId].Sequence {
-			panic("GetResult cache missed!")
+		if opType == GET {
+			if sequence != shardSM.GetResultCache[ckId].Sequence {
+				panic("GetResult cache missed!")
+			}
+			result = shardSM.GetResultCache[ckId].Value
+			err = shardSM.GetResultCache[ckId].Err
 		}
-		value = shardSM.GetResultCache[op.CkId].Value
-		err = shardSM.GetResultCache[op.CkId].Err
+	} else if sequence == shardSM.Sequence[ckId] {
 
-	} else if op.Sequence == shardSM.Sequence[op.CkId] {
-
-		value, exist = shardSM.KVs[op.Argument.(string)]
-		if !exist {
-			err = ErrNoKey
+		switch opType {
+		case GET:
+			result, exist = shardSM.KVs[key]
+			if !exist {
+				err = ErrNoKey
+			}
+			shardSM.GetResultCache[ckId] = GetResult{
+				Sequence: sequence,
+				Value:    result,
+				Err:      err,
+			}
+		case PUT:
+			shardSM.KVs[key] = value
+		case APPEND:
+			shardSM.KVs[key] += value
 		}
-		shardSM.GetResultCache[op.CkId] = GetResult{
-			Sequence:	op.Sequence,
-			Value:		value,
-			Err:		err,
-		}
-		shardSM.Sequence[op.CkId]++
+		shardSM.Sequence[ckId]++
 
 	} else {
 		panic("Unordered ApplyMsg!")
 	}
-	return value, err
+	return result, err
 }
 
-func (kv *ShardKV) applyPutAppend(op *Op) Err {
+func (kv *ShardKV) applyNewConfig(newConfig *shardmaster.Config) {
 
-	DPrintf("[ShardKV %v, GID %v]: apply PutAppend command %v",
-		kv.me, kv.gid, *op)
-
-	err := OK
-	if kv.config.Shards[op.ShardId] != kv.gid {
-		err = ErrWrongGroup
-		return err
-	}
-
-	_, exist := kv.pullShardSet[ShardIndex{kv.previousConfig.Num, op.ShardId}]
-	if exist {
-		err = ErrRetry
-		return err
-	}
-
-	shardSM := kv.stateMachine[op.ShardId]
-	if op.Sequence == shardSM.Sequence[op.CkId] {
-
-		keyValue := op.Argument.(KeyValue)
-		if op.Operation == PUT {
-			shardSM.KVs[keyValue.Key] = keyValue.Value
-		} else {
-			shardSM.KVs[keyValue.Key] += keyValue.Value
-		}
-		shardSM.Sequence[op.CkId]++
-
-	} else if op.Sequence > shardSM.Sequence[op.CkId] {
-		panic("Unordered ApplyMsg!")
-	}
-	return err
-}
-
-func (kv *ShardKV) applyNewConfig(op *Op) Err {
-	newConfig := op.Argument.(shardmaster.Config)
-
-	DPrintf("[ShardKV %v, GID %v]: current config is %v, apply new config %v.",
+	DPrintf("[ShardKV %v, GID %v][applyNewConfig]: current config is %v, apply new config %v.",
 		kv.me, kv.gid, kv.config, newConfig)
 
 	if newConfig.Num <= kv.config.Num {
-		return OK
+		return
 	}
 
 	if newConfig.Num > kv.config.Num + 1 {
@@ -438,17 +430,17 @@ func (kv *ShardKV) applyNewConfig(op *Op) Err {
 		}
 	}
 	kv.previousConfig = kv.config
-	kv.config = newConfig
+	kv.config = *newConfig
 	kv.configInstalled = false
-	DPrintf("[ShardKV %v, GID %v]: after apply, the current config is %v",
-		kv.me, kv.gid, kv.config)
-	return OK
 }
 
-func (kv *ShardKV) installConfig(op *Op) Err {
-	configNum := op.Argument.(int)
+func (kv *ShardKV) installConfig(configNum int) {
+
+	DPrintf("[ShardKV %v, GID %v][installConfig]: install config version %v.",
+		kv.me, kv.gid, configNum)
+
 	if configNum != kv.config.Num {
-		return ErrInstallStaleConfig
+		return
 	}
 
 	if len(kv.pullShardSet) != 0 {
@@ -456,63 +448,69 @@ func (kv *ShardKV) installConfig(op *Op) Err {
 	}
 
 	kv.configInstalled = true
-	return OK
 }
 
 
-func (kv *ShardKV) installShard(op *Op) Err {
-	shardSM := op.Argument.(ShardStateMachine)
+func (kv *ShardKV) installShard(shardSM *ShardStateMachine) {
+
+	DPrintf("[ShardKV %v, GID %v][installShard]: install shard state machine %v.",
+		kv.me, kv.gid, *shardSM)
+
 	shardIndex := ShardIndex{
 		ConfigNum: shardSM.ConfigNum - 1,
 		ShardId:   shardSM.ShardId,
 	}
 
-	_, exist := kv.pullShardSet[shardIndex]
-	if exist {
+	if _, exist := kv.pullShardSet[shardIndex]; exist {
 		if shardSM.ConfigNum != kv.config.Num {
 			panic("Install wrong version Shard")
 		}
 
-		kv.stateMachine[shardSM.ShardId] = &shardSM
+		kv.stateMachine[shardSM.ShardId] = shardSM
 		kv.cleanShardSet[shardIndex] = kv.pullShardSet[shardIndex]
 
 		delete(kv.pullShardSet, shardIndex)
 	}
-	return OK
 }
 
-func (kv *ShardKV) cleanShard(op *Op) Err {
-	args := op.Argument.(CleanShardArgs)
+func (kv *ShardKV) cleanShard(args *CleanShardArgs) bool {
+
+	DPrintf("[ShardKV %v, GID %v][cleanShard]: clean shard (ConfigNum: %v, ShardId: %v).",
+		kv.me, kv.gid, args.ConfigNum, args.ShardId)
+
 	if kv.config.Shards[args.ShardId] == kv.gid {
-		return ErrRetry
+		return false
 	}
 
-	shardSM, exist := kv.stateMachine[args.ShardId]
-	if exist {
+	if shardSM, exist := kv.stateMachine[args.ShardId]; exist {
 		if shardSM.ConfigNum <= args.ConfigNum {
 			delete(kv.stateMachine, args.ShardId)
-			return OK
+			return true
 		} else {
-			return ErrRetry
+			return false
 		}
 	}
-	return OK
+	return true
 }
 
 func (kv *ShardKV) cleanPendingRequests(term int, index int, value string, err Err) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	for requestIndex, requestResult := range kv.pendingRequest {
+	for requestIndex, requestResult := range kv.pendingRequests {
 
 		if requestIndex.term < term || (requestIndex.term == term && requestIndex.index < index) {
-			requestResult.pendingCh <- ErrRetry
-			delete(kv.pendingRequest, requestIndex)
+
+			requestResult.err = ErrRetry
+			close(requestResult.pendingCh)
+			delete(kv.pendingRequests, requestIndex)
 
 		} else if requestIndex.term == term && requestIndex.index == index {
+
 			requestResult.value = value
-			requestResult.pendingCh <- err
-			delete(kv.pendingRequest, requestIndex)
+			requestResult.err = err
+			close(requestResult.pendingCh)
+			delete(kv.pendingRequests, requestIndex)
 		}
 	}
 }
@@ -526,6 +524,9 @@ func (kv *ShardKV) mayTakeSnapshot() {
 		return
 	}
 
+	DPrintf("[ShardKV %v, GID %v]: take snapshot.",
+		kv.me, kv.gid)
+
 	buffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(buffer)
 	encoder.Encode(kv.previousConfig)
@@ -536,6 +537,7 @@ func (kv *ShardKV) mayTakeSnapshot() {
 	encoder.Encode(kv.stateMachine)
 	encoder.Encode(kv.lastAppliedIndex)
 	data := buffer.Bytes()
+
 	go func(kv *ShardKV, data []byte, lastAppliedIndex int) {
 		kv.rf.TakeSnapshot(data, lastAppliedIndex)
 	}(kv, data, kv.lastAppliedIndex)
@@ -546,8 +548,7 @@ func (kv *ShardKV) configDaemon() {
 	for {
 		select {
 		case <- time.After(ConfigUpdateTime):
-			_, isLeader := kv.rf.GetState()
-			if isLeader {
+			if _, isLeader := kv.rf.GetState(); isLeader {
 				kv.mu.Lock()
 				currentConfigNum := kv.config.Num
 				configInstalled := kv.configInstalled
@@ -556,21 +557,20 @@ func (kv *ShardKV) configDaemon() {
 				if configInstalled {
 					newConfig := kv.mck.Query(-1)
 					if newConfig.Num > currentConfigNum {
-						newConfig = kv.mck.Query(currentConfigNum + 1)
+						if newConfig.Num > currentConfigNum + 1 {
+							newConfig = kv.mck.Query(currentConfigNum + 1)
+						}
 						op := Op{
 							Operation: NEWCONFIG,
 							Argument:  newConfig,
-							CkId:      0,
-							ShardId:   0,
-							Sequence:  0,
 						}
-						DPrintf("[ShardKV %v, GID %v]: current config is %v, get new config %v, send command %v.",
+						DPrintf("[ShardKV %v, GID %v][configDaemon]: current config is %v, get new config %v, send command %v.",
 							kv.me, kv.gid, kv.config, newConfig, op)
 						kv.rf.Start(op)
 					}
 				}
 			}
-		case <- kv.configDaemonExit:
+		case <- kv.configDaemonExitCh:
 			return
 		}
 	}
@@ -582,15 +582,15 @@ func (kv *ShardKV) pullShardDaemon() {
 		select {
 		case <- time.After(ShardPullTime):
 			kv.pullShards()
-		case <- kv.pullShardDaemonExit:
+		case <- kv.pullShardDaemonExitCh:
 			return
 		}
 	}
 }
 
 func (kv *ShardKV) pullShards() {
-	kv.mu.Lock()
 
+	kv.mu.Lock()
 	pullShardSet := make(map[ShardIndex][]string)
 	for shardIndex, servers := range kv.pullShardSet {
 		pullShardSet[shardIndex] = append([]string{}, servers...)
@@ -614,28 +614,22 @@ func (kv *ShardKV) pullShards() {
 		op := Op{
 			Operation: INSTALLCONFIG,
 			Argument:  configNum,
-			CkId:      0,
-			ShardId:   0,
-			Sequence:  0,
 		}
 		kv.rf.Start(op)
 	}
 }
 
 func (kv *ShardKV) pullShard(configNum int, shardId int, servers []string, wg *sync.WaitGroup) {
-	valid, shardSM := kv.getShardContent(configNum, shardId, servers)
-	if valid {
+
+	if valid, shardSM := kv.getShardContent(configNum, shardId, servers); valid {
 		for {
 			op := Op{
 				Operation: INSTALLSHARD,
 				Argument:  *shardSM,
-				CkId:      0,
-				ShardId:   0,
-				Sequence:  0,
 			}
-			wrongLeader, err, _ := kv.sendCommand(&op)
+			wrongLeader, _, err := kv.sendCommand(&op)
 
-			if wrongLeader || (!wrongLeader && err == OK) {
+			if wrongLeader || err == OK {
 				break
 			}
 		}
@@ -645,6 +639,7 @@ func (kv *ShardKV) pullShard(configNum int, shardId int, servers []string, wg *s
 }
 
 func (kv *ShardKV) getShardContent(configNum int, shardId int, servers []string) (bool, *ShardStateMachine) {
+
 	if len(servers) == 0 {
 		panic("Previous groups' server list is empty!")
 	}
@@ -677,13 +672,14 @@ func (kv *ShardKV) cleanShardDaemon() {
 		select {
 		case <- time.After(ShardCleanTime):
 			kv.cleanShards()
-		case <- kv.cleanShardDaemonExit:
+		case <- kv.cleanShardDaemonExitCh:
 			return
 		}
 	}
 }
 
 func (kv *ShardKV) cleanShards() {
+
 	_, isLeader := kv.rf.GetState()
 
 	if isLeader {
@@ -698,7 +694,6 @@ func (kv *ShardKV) cleanShards() {
 
 		for shardIndex, servers := range cleanShardSet {
 			wg.Add(1)
-
 			go kv.cleanShardRequest(shardIndex.ConfigNum, shardIndex.ShardId, servers, &wg)
 		}
 
@@ -707,6 +702,7 @@ func (kv *ShardKV) cleanShards() {
 }
 
 func (kv *ShardKV) cleanShardRequest(configNum int, shardId int, servers []string, wg *sync.WaitGroup) {
+
 	if kv.sendCleanRequest(configNum, shardId, servers) {
 		for {
 			op := Op{
@@ -715,13 +711,10 @@ func (kv *ShardKV) cleanShardRequest(configNum int, shardId int, servers []strin
 					ConfigNum: configNum,
 					ShardId:   shardId,
 				},
-				CkId:      0,
-				ShardId:   0,
-				Sequence:  0,
 			}
-			wrongLeader, err, _ := kv.sendCommand(&op)
+			wrongLeader, _, err := kv.sendCommand(&op)
 
-			if wrongLeader || (!wrongLeader && err == OK) {
+			if wrongLeader || err == OK {
 				break
 			}
 		}
@@ -769,10 +762,12 @@ func (kv *ShardKV) sendCleanRequest(configNum int, shardId int, servers []string
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
-	kv.applyDaemonExit <- true
-	kv.configDaemonExit <- true
-	kv.pullShardDaemonExit <- true
-	kv.cleanShardDaemonExit <- true
+	go func() {
+		kv.applyDaemonExitCh <- true
+		kv.configDaemonExitCh <- true
+		kv.pullShardDaemonExitCh <- true
+		kv.cleanShardDaemonExitCh <- true
+	}()
 }
 
 //
@@ -809,7 +804,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-	labgob.Register(KeyValue{})
 	labgob.Register(shardmaster.Config{})
 	labgob.Register(ShardStateMachine{})
 	labgob.Register(make(map[string]string))
@@ -837,9 +831,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
-	kv.pendingRequest = make(map[RequestIndex]*RequestResult)
-	kv.stateMachine = make(map[int]*ShardStateMachine)
-	kv.lastAppliedIndex	= -1
+
+	// Use something like this to talk to the shardmaster:
+	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.previousConfig = shardmaster.Config{
 		Num:	0,
 		Shards: [shardmaster.NShards]int{},
@@ -851,26 +845,27 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		Groups: make(map[int][]string),
 	}
 	kv.configInstalled = true
+
 	kv.pullShardSet = make(map[ShardIndex][]string)
 	kv.cleanShardSet = make(map[ShardIndex][]string)
 
-	kv.persister = persister
-	kv.applyDaemonExit = make(chan bool)
-	kv.configDaemonExit = make(chan bool)
-	kv.pullShardDaemonExit = make(chan bool)
-	kv.cleanShardDaemonExit = make(chan bool)
-
-
-	// Use something like this to talk to the shardmaster:
-	kv.mck = shardmaster.MakeClerk(kv.masters)
+	kv.stateMachine = make(map[int]*ShardStateMachine)
+	kv.pendingRequests = make(map[RequestIndex]*RequestResult)
+	kv.lastAppliedIndex	= -1
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
+	kv.applyDaemonExitCh = make(chan bool)
+	kv.configDaemonExitCh = make(chan bool)
+	kv.pullShardDaemonExitCh = make(chan bool)
+	kv.cleanShardDaemonExitCh = make(chan bool)
 	go kv.applyDaemon()
 	go kv.configDaemon()
 	go kv.pullShardDaemon()
 	go kv.cleanShardDaemon()
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	return kv
 }
