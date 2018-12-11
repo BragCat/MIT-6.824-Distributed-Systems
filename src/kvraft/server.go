@@ -25,49 +25,49 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Operation string
-	Key string
-	Value string
-	CkId int64
-	Sequence int
+	Operation 	string
+	Key 		string
+	Value 		string
+	CkId 		int64
+	Sequence 	int
 }
 
 type RequestIndex struct {
-	term int
-	index int
+	term 	int
+	index 	int
 }
 
 type RequestResult struct {
-	value string
+	value 		string
 	pendingChan chan bool
 }
 
 type GetResult struct {
-	Sequence int
-	Value string
+	Sequence 	int
+	Value 		string
 }
 
 type StateMachine struct {
-	KVs map[string]string
-	Sequence map[int64]int
-	GetResultCache map[int64]GetResult
-	LastAppliedIndex int
+	KVs 				map[string]string
+	Sequence 			map[int64]int
+	GetResultCache 		map[int64]GetResult
+	LastAppliedIndex 	int
 }
 
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	mu      		sync.Mutex
+	me      		int
+	rf      		*raft.Raft
+	applyCh 		chan raft.ApplyMsg
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate 	int // snapshot if log grows this big
 
 	// Your definitions here.
-	persister *raft.Persister
+	persister 		*raft.Persister
 	pendingRequests map[RequestIndex]*RequestResult
-	sm StateMachine
-	exitSignal chan bool
+	sm 				StateMachine
+	exitSignal 		chan bool
 }
 
 func (kv *KVServer) sendOpLog(op Op) (bool, Err, string) {
@@ -107,11 +107,11 @@ func (kv *KVServer) sendOpLog(op Op) (bool, Err, string) {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	op := Op{
-		Operation: "Get",
-		Key: args.Key,
-		Value: "",
-		CkId: args.CkId,
-		Sequence: args.Sequence,
+		Operation: 	"Get",
+		Key: 		args.Key,
+		Value: 		"",
+		CkId: 		args.CkId,
+		Sequence: 	args.Sequence,
 	}
 
 	wrongLeader, err, value := kv.sendOpLog(op)
@@ -123,11 +123,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	op := Op{
-		Operation: args.Op,
-		Key: args.Key,
-		Value: args.Value,
-		CkId: args.CkId,
-		Sequence: args.Sequence,
+		Operation: 	args.Op,
+		Key: 		args.Key,
+		Value: 		args.Value,
+		CkId: 		args.CkId,
+		Sequence: 	args.Sequence,
 	}
 
 	wrongLeader, err, _ := kv.sendOpLog(op)
@@ -301,10 +301,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.persister = persister
 	kv.pendingRequests = make(map[RequestIndex]*RequestResult)
 	kv.sm = StateMachine {
-		KVs: make(map[string]string),
-		Sequence: make(map[int64]int),
-		GetResultCache: make(map[int64]GetResult),
-		LastAppliedIndex: -1,
+		KVs: 				make(map[string]string),
+		Sequence: 			make(map[int64]int),
+		GetResultCache: 	make(map[int64]GetResult),
+		LastAppliedIndex: 	-1,
 	}
 	kv.exitSignal = make(chan bool)
 

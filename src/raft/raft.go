@@ -43,64 +43,64 @@ import (
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
 type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-	CommandTerm int
+	CommandValid 	bool
+	Command      	interface{}
+	CommandIndex 	int
+	CommandTerm 	int
 }
 
 type Entry struct {
-	Term int
+	Term 	int
 	Command interface{}
 }
 
 type StateType string
 
 const (
-	maxElectionTimeout = 450
-	minElectionTimeout = 300
-	heartBeatTime = 105
+	maxElectionTimeout 		= 450
+	minElectionTimeout 		= 300
+	heartBeatTime 			= 105
 
-	leader StateType = "leader"
-	candidate StateType = "candidate"
-	follower StateType = "follower"
+	leader 		StateType 	= "leader"
+	candidate 	StateType 	= "candidate"
+	follower 	StateType 	= "follower"
 )
 
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	mu        			sync.Mutex          // Lock to protect shared access to this peer's state
+	peers     			[]*labrpc.ClientEnd // RPC end points of all peers
+	persister 			*Persister          // Object to hold this peer's persisted state
+	me        			int                 // this peer's index into peers[]
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 	// Paper defined persistent state
-	currentTerm int
-	votedFor int
-	log []Entry
-	lastIncludedIndex int
-	lastIncludedTerm int
+	currentTerm 		int
+	votedFor 			int
+	log 				[]Entry
+	lastIncludedIndex 	int
+	lastIncludedTerm 	int
 
 	// Paper defined volatile state
-	commitIndex int
-	lastApplied int
+	commitIndex 		int
+	lastApplied 		int
 
 	// Paper defined volatile state on leaders
-	nextIndex []int
-	matchIndex []int
+	nextIndex 			[]int
+	matchIndex 			[]int
 
 	// My volatile state
-	majorityNum int
-	voteCnt int
-	applyCh chan ApplyMsg
-	state StateType
-	electionTimer *time.Timer
-	heartBeatTimer *time.Timer
+	majorityNum 		int
+	voteCnt 			int
+	applyCh 			chan ApplyMsg
+	state 				StateType
+	electionTimer 		*time.Timer
+	heartBeatTimer 		*time.Timer
 }
 
 // return currentTerm and whether this server
@@ -190,10 +190,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term int
-	CandidateId int
-	LastLogTerm int
-	LastLogIndex int
+	Term 			int
+	CandidateId 	int
+	LastLogTerm 	int
+	LastLogIndex 	int
 }
 
 //
@@ -202,7 +202,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term int
+	Term 		int
 	VoteGranted bool
 }
 
@@ -405,10 +405,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			newCommitIndex := min(args.LeaderCommit, rf.offset2index(len(rf.log) - 1))
 			for index := rf.commitIndex + 1; index <= newCommitIndex; index++ {
 				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command: rf.log[rf.index2offset(index)].Command,
-					CommandIndex: index + 1,
-					CommandTerm: rf.log[rf.index2offset(index)].Term,
+					CommandValid: 	true,
+					Command: 		rf.log[rf.index2offset(index)].Command,
+					CommandIndex: 	index + 1,
+					CommandTerm: 	rf.log[rf.index2offset(index)].Term,
 				}
 				DPrintf("[Raft %v, Term %v]: commit {%v} at index {%v}.",
 					rf.me, rf.currentTerm, rf.log[rf.index2offset(index)].Command, index)
@@ -490,11 +490,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 		if args.LastIncludedIndex > rf.lastIncludedIndex {
 			lastIncludedOffset := rf.index2offset(args.LastIncludedIndex)
-			if lastIncludedOffset >= len(rf.log)-1 {
+			if lastIncludedOffset >= len(rf.log) - 1 {
 				rf.log = make([]Entry, 0)
 			} else {
 				if rf.log[lastIncludedOffset].Term == rf.lastIncludedTerm {
-					rf.log = append([]Entry{}, rf.log[lastIncludedOffset+1:]...)
+					rf.log = append([]Entry{}, rf.log[lastIncludedOffset + 1 : ]...)
 				} else {
 					rf.log = make([]Entry, 0)
 				}
@@ -528,13 +528,8 @@ func (rf *Raft) processInstallSnapshot(peerId int, args *InstallSnapshotArgs, re
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm || reply.Term < rf.currentTerm || rf.state != leader {
-		return
-	}
-
 	if reply.Term > rf.currentTerm {
 		rf.setToFollower(reply.Term)
-		return
 	}
 
 	rf.nextIndex[peerId] = max(rf.nextIndex[peerId], args.LastIncludedIndex + 1)
@@ -548,7 +543,6 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
 	if lastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-
 
 	lastIncludedOffset := rf.index2offset(lastIncludedIndex)
 
@@ -718,10 +712,10 @@ func (rf *Raft) startElection() {
 	}
 
 	args := &RequestVoteArgs{
-		Term: rf.currentTerm,
-		CandidateId: rf.me,
-		LastLogTerm: lastLogTerm,
-		LastLogIndex: lastLogIndex,
+		Term: 			rf.currentTerm,
+		CandidateId: 	rf.me,
+		LastLogTerm: 	lastLogTerm,
+		LastLogIndex: 	lastLogIndex,
 	}
 
 	rf.persist()
@@ -843,10 +837,10 @@ func (rf *Raft) updateCommitIndex(updatedIndex int) {
 	}
 	for index := rf.commitIndex + 1; index <= newCommitIndex; index++ {
 		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command: rf.log[rf.index2offset(index)].Command,
-			CommandIndex: index + 1,
-			CommandTerm: rf.log[rf.index2offset(index)].Term,
+			CommandValid: 	true,
+			Command: 		rf.log[rf.index2offset(index)].Command,
+			CommandIndex: 	index + 1,
+			CommandTerm: 	rf.log[rf.index2offset(index)].Term,
 		}
 		DPrintf("[Raft %v, Term %v]: commit {%v} at index {%v}.",
 			rf.me, rf.currentTerm, rf.log[rf.index2offset(index)].Command, index)

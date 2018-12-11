@@ -13,11 +13,11 @@ import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
+	servers 	[]*labrpc.ClientEnd
 	// Your data here.
-	id int64
-	sequence int
-	mu sync.Mutex
+	id 			int64
+	sequence 	int
+	mu 			sync.Mutex
 }
 
 func nrand() int64 {

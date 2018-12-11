@@ -11,12 +11,12 @@ import "labgob"
 type OperationType string
 
 const (
-	TIMEOUT = 1000 * time.Millisecond
+	TIMEOUT 				= 1000 * time.Millisecond
 
-	JOIN 	OperationType = "JOIN"
-	LEAVE 	OperationType = "LEAVE"
-	MOVE 	OperationType = "MOVE"
-	QUERY	OperationType = "QUERY"
+	JOIN 	OperationType 	= "JOIN"
+	LEAVE 	OperationType 	= "LEAVE"
+	MOVE 	OperationType 	= "MOVE"
+	QUERY	OperationType 	= "QUERY"
 )
 
 type RequestIndex struct {

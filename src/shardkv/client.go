@@ -8,7 +8,10 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "labrpc"
+import (
+	"labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 import "shardmaster"
@@ -36,10 +39,14 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardmaster.Clerk
-	config   shardmaster.Config
-	make_end func(string) *labrpc.ClientEnd
+	sm       	*shardmaster.Clerk
+	config   	shardmaster.Config
+	make_end 	func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	id 			int64
+	// Every shard a sequence to make request to different shard won't be delayed
+	sequence	[]int
+	mu 			sync.Mutex
 }
 
 //
@@ -56,6 +63,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.id = nrand()
+	ck.sequence = make([]int, shardmaster.NShards)
 	return ck
 }
 
@@ -66,11 +75,18 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	shard := key2shard(key)
+	args := GetArgs{
+		Key:     	key,
+		CkId:     	ck.id,
+		ShardId:	shard,
+		Sequence: 	ck.sequence[shard],
+	}
 
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -79,6 +95,7 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.sequence[shard]++
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -98,15 +115,22 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 //
-func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+func (ck *Clerk) PutAppend(key string, value string, op OperationType) {
 
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	shard := key2shard(key)
+	args := PutAppendArgs{
+		Key:   		key,
+		Value: 		value,
+		Op:    		op,
+		CkId:		ck.id,
+		ShardId:	shard,
+		Sequence:	ck.sequence[shard],
+	}
 
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
@@ -114,6 +138,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.WrongLeader == false && reply.Err == OK {
+					ck.sequence[shard]++
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
@@ -128,8 +153,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, PUT)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, APPEND)
 }
